@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Fortress</title>
+  <desc id="desc">Shield with an F monogram, the logo of Fortress Intelligent Security System</desc>
+
+  <g id="container">
+    <rect x="0" y="0" width="512" height="512" rx="112" fill="#0B1622"/>
+  </g>
+
+  <g id="shield">
+    <path id="shield-left" fill="#3FCBEC"
+      d="M256 56 L420 114 V238 C420 344 350 420 256 458 C162 420 92 344 92 238 V114 Z"/>
+    <path id="shield-right" fill="#2A9FC2"
+      d="M256 56 L420 114 V238 C420 344 350 420 256 458 Z"/>
+  </g>
+
+  <g id="monogram" fill="#0B1622">
+    <path id="f-stem-top" d="M186 150 H346 L320 196 H234 V372 L186 344 Z"/>
+    <path id="f-middle" d="M234 240 H318 L296 282 H234 Z"/>
+  </g>
+</svg>
