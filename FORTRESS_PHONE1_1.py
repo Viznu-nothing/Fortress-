@@ -1511,46 +1511,20 @@ def get_state():
 # FACE REQUEST
 # ============================================================
 
-FACE_PROCESS = None
-FACE_PROCESS_LOCK = threading.Lock()
-
 @app.route(
     "/face_request",
     methods=["POST"]
 )
 def face_request():
-    """Start the user's existing face verifier on the laptop webcam."""
-    global FACE_PROCESS
-    base_dir = Path(__file__).resolve().parent
-    face_script = base_dir / "face_verify_test.py"
+    """Ask the laptop HUD to run face verification on the laptop webcam.
 
-    with FACE_PROCESS_LOCK:
-        if FACE_PROCESS is not None and FACE_PROCESS.poll() is None:
-            state["face"] = "SCANNING"
-            state["message"] = "FACE VERIFICATION ALREADY RUNNING ON LAPTOP"
-            return jsonify(state)
-
-        if not face_script.exists():
-            state["face"] = "FAILED"
-            state["face_verified"] = False
-            state["message"] = "FACE SCAN ERROR: face_verify_test.py NOT FOUND IN PROJECT FOLDER"
-            return jsonify(state), 500
-
-        try:
-            FACE_PROCESS = subprocess.Popen(
-                [sys.executable, str(face_script)],
-                cwd=str(base_dir),
-                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
-            )
-            state["face"] = "SCANNING"
-            state["face_verified"] = False
-            state["message"] = "FACE VERIFICATION STARTED — CHECK LAPTOP WEBCAM WINDOW"
-        except Exception as exc:
-            state["face"] = "FAILED"
-            state["face_verified"] = False
-            state["message"] = f"FACE SCAN ERROR: COULD NOT START VERIFIER ({exc})"
-            return jsonify(state), 500
-
+    The HUD (FORTRESS_FACE_PHONE_INTEGRATED.py) polls /state, starts the
+    scan when it sees SCANNING, and reports back via /face_verified or
+    /face_denied.
+    """
+    state["face"] = "SCANNING"
+    state["face_verified"] = False
+    state["message"] = "FACE VERIFICATION STARTED — CHECK LAPTOP WEBCAM WINDOW"
     return jsonify(state)
 
 
