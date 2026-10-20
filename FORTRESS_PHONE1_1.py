@@ -31,6 +31,7 @@ state = {
     "password": "LOCKED",          # PHONE PIN state
     "security_code": "LOCKED",     # CARD VERIFICATION state
     "vault": "LOCKED",
+    "sequence": "LOCKED",
 
     "face_verified": False,
     "palm_verified": False,
@@ -563,6 +564,54 @@ body {
     font-weight: 700;
 
     letter-spacing: 1px;
+}
+
+
+/* ============================================================
+   SEQUENCE BOXES
+   ============================================================ */
+
+.seq-row {
+
+    display: flex;
+
+    justify-content: center;
+
+    gap: 8px;
+}
+
+.seq-box {
+
+    width: 44px;
+    height: 54px;
+
+    padding: 0;
+
+    border-radius: 10px;
+
+    border:
+        1px solid #248BFF;
+
+    background: #02070C;
+
+    color: #F4FAFF;
+
+    text-align: center;
+
+    font-size: 24px;
+
+    font-family: Consolas, monospace;
+
+    outline: none;
+}
+
+.seq-box:focus {
+
+    border-color: #20D9FF;
+
+    box-shadow:
+        0 0 16px
+        rgba(32,217,255,0.25);
 }
 
 
@@ -1157,6 +1206,21 @@ body {
         <div class="error" id="securityError"></div>
     </div>
 
+    <!-- FINAL SEQUENCE PANEL -->
+    <div class="security-panel" id="sequencePanel">
+        <div class="security-title">ENTER THE 6 CHARACTERS SHOWN ON THE LAPTOP</div>
+        <div class="seq-row" id="sequenceBoxes">
+            <input class="seq-box" type="text" maxlength="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <input class="seq-box" type="text" maxlength="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <input class="seq-box" type="text" maxlength="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <input class="seq-box" type="text" maxlength="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <input class="seq-box" type="text" maxlength="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <input class="seq-box" type="text" maxlength="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        </div>
+        <button class="verify-security" type="button" id="sequenceButton" onclick="submitSequence()">SUBMIT</button>
+        <div class="error" id="sequenceError"></div>
+    </div>
+
     <!-- ======================================================
          FACE BUTTON
          ====================================================== -->
@@ -1231,6 +1295,14 @@ function updateUI(data) {
     palmPanel.style.display = "none";
     passwordPanel.style.display = "none";
     securityPanel.style.display = "none";
+    const sequencePanel = document.getElementById("sequencePanel");
+    const showSequence = data.sequence === "ACTIVE";
+    if (showSequence && sequencePanel.style.display !== "block") {
+        sequencePanel.style.display = "block";
+        sequenceBoxes()[0].focus();
+    } else if (!showSequence) {
+        sequencePanel.style.display = "none";
+    }
 
     if (data.face === "READY" || data.face === "FAILED") {
         layer1.className = data.face === "FAILED" ? "layer failed" : "layer active";
@@ -1457,6 +1529,68 @@ async function startCardScan() {
     }
 }
 
+// ============================================================
+// FINAL SEQUENCE
+// ============================================================
+function sequenceBoxes() {
+    return Array.from(document.querySelectorAll("#sequenceBoxes .seq-box"));
+}
+
+async function submitSequence() {
+    const boxes = sequenceBoxes();
+    const value = boxes.map(box => box.value).join("");
+    const error = document.getElementById("sequenceError");
+    const button = document.getElementById("sequenceButton");
+    error.textContent = "";
+    if (boxes.some(box => box.value.length !== 1)) {
+        error.textContent = "ENTER ALL 6 CHARACTERS";
+        return;
+    }
+    button.disabled = true;
+    button.textContent = "VERIFYING...";
+    try {
+        const response = await fetch("/sequence", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({sequence: value})
+        });
+        const data = await response.json();
+        updateUI(data);
+        error.textContent = data.message || "ACCESS DENIED";
+        boxes.forEach(box => box.value = "");
+        boxes[0].focus();
+    } catch (e) {
+        error.textContent = "CONTROLLER ERROR";
+    } finally {
+        button.disabled = false;
+        button.textContent = "SUBMIT";
+    }
+}
+
+// One character per box: typing moves forward, backspace moves back,
+// pasting fills the boxes in order.
+sequenceBoxes().forEach((box, index, boxes) => {
+    box.addEventListener("input", () => {
+        const chars = Array.from(box.value);
+        if (chars.length > 1) {
+            chars.forEach((ch, i) => { if (boxes[index + i]) boxes[index + i].value = ch; });
+            const next = boxes[Math.min(index + chars.length, boxes.length - 1)];
+            next.focus();
+        } else if (chars.length === 1 && boxes[index + 1]) {
+            boxes[index + 1].focus();
+        }
+    });
+    box.addEventListener("keydown", event => {
+        if (event.key === "Backspace" && !box.value && boxes[index - 1]) {
+            boxes[index - 1].focus();
+            boxes[index - 1].value = "";
+            event.preventDefault();
+        } else if (event.key === "Enter") {
+            submitSequence();
+        }
+    });
+});
+
 // ENTER key submits the phone PIN.
 document.getElementById("password").addEventListener("keydown", function(event) {
     if (event.key === "Enter") verifyPassword();
@@ -1538,7 +1672,7 @@ def face_verified():
         "palm": "ACTIVE", "palm_verified": False,
         "password": "LOCKED", "password_verified": False,
         "security_code": "LOCKED", "security_code_verified": False,
-        "card_owner": "", "card_id": "", "vault": "LOCKED",
+        "card_owner": "", "card_id": "", "vault": "LOCKED", "sequence": "LOCKED",
         "message": "FACE VERIFIED // PALM SCAN REQUIRED"
     })
     return jsonify(state)
@@ -1551,7 +1685,7 @@ def face_denied():
         "palm": "LOCKED", "palm_verified": False,
         "password": "LOCKED", "password_verified": False,
         "security_code": "LOCKED", "security_code_verified": False,
-        "card_owner": "", "card_id": "", "vault": "LOCKED",
+        "card_owner": "", "card_id": "", "vault": "LOCKED", "sequence": "LOCKED",
         "message": "ACCESS DENIED // FACE VERIFICATION FAILED"
     })
     return jsonify(state)
@@ -1731,7 +1865,7 @@ def verify_password():
 def reset():
     state.update({
         "face": "READY", "palm": "LOCKED", "password": "LOCKED",
-        "security_code": "LOCKED", "vault": "LOCKED",
+        "security_code": "LOCKED", "vault": "LOCKED", "sequence": "LOCKED",
         "face_verified": False, "palm_verified": False,
         "password_verified": False, "security_code_verified": False,
         "message": "FACE VERIFICATION REQUIRED"
@@ -1825,8 +1959,54 @@ def card_verified():
         state["message"] = "PHONE PIN VERIFICATION REQUIRED"
         return jsonify(state), 403
     state.update(security_code="VERIFIED", security_code_verified=True,
-                 card_owner=DEMO_CARD_OWNER, card_id=DEMO_CARD_ID, vault="AUTHORIZED",
+                 card_owner=DEMO_CARD_OWNER, card_id=DEMO_CARD_ID, vault="LOCKED",
+                 sequence="PENDING",
                  message=f"QR VERIFIED // {DEMO_CARD_OWNER}")
+    return jsonify(state)
+
+
+# ============================================================
+# FINAL SEQUENCE STAGE (hidden — never named in the interface)
+# The laptop flashes 6 symbols for 3 seconds, then calls
+# /sequence_ready so the phone shows 6 character boxes. Whatever is
+# typed on the phone is always rejected; only the spoken phrase heard
+# by the laptop HUD unlocks the vault, via /sequence_unlock.
+# ============================================================
+
+def request_is_local():
+    # Only the HUD on this laptop may drive this stage; the phone is on the LAN.
+    return request.remote_addr in ("127.0.0.1", "::1")
+
+
+@app.route("/sequence_ready", methods=["POST"])
+def sequence_ready():
+    if not request_is_local():
+        return jsonify(state), 403
+    if state.get("sequence") != "PENDING":
+        return jsonify(state), 409
+    state.update(sequence="ACTIVE", message="ENTER THE 6 CHARACTERS SHOWN ON THE LAPTOP")
+    return jsonify(state)
+
+
+@app.route("/sequence", methods=["POST"])
+def submit_sequence():
+    if state.get("sequence") != "ACTIVE":
+        state["message"] = "SEQUENCE NOT AVAILABLE"
+        return jsonify(state), 403
+    # Intentionally never accepted, even when every symbol is correct.
+    state["vault"] = "LOCKED"
+    state["message"] = "ACCESS DENIED"
+    return jsonify(state), 401
+
+
+@app.route("/sequence_unlock", methods=["POST"])
+def sequence_unlock():
+    if not request_is_local():
+        return jsonify(state), 403
+    if not state.get("security_code_verified") or state.get("sequence") != "ACTIVE":
+        return jsonify(state), 403
+    state.update(sequence="VERIFIED", vault="AUTHORIZED",
+                 message=f"ACCESS AUTHORIZED // {DEMO_CARD_OWNER}")
     return jsonify(state)
 
 
