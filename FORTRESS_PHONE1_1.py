@@ -1986,7 +1986,10 @@ def run_card_scan():
     """Show a QR scanning animation on the laptop webcam, then approve the demo card."""
     camera = None
     try:
-        camera = cv2.VideoCapture(0)
+        # Same camera opening as face_verify_test.py: DirectShow first on Windows.
+        camera = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(0)
+        if not camera.isOpened():
+            camera = cv2.VideoCapture(0)
         if not camera.isOpened():
             state.update(security_code="FAILED", security_code_verified=False,
                          message="CARD SCAN ERROR: LAPTOP WEBCAM COULD NOT OPEN")
