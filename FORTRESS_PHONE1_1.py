@@ -102,8 +102,11 @@ def trigger_backup(trigger, detail=""):
     """Start a backup in the background. Call from inside a request."""
     now = time.time()
     if now - last_backup_time.get(trigger, 0) < BACKUP_COOLDOWN_SECONDS:
+        print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — already backed up in the last "
+              f"{BACKUP_COOLDOWN_SECONDS} s, skipping")
         return
     last_backup_time[trigger] = now
+    print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — backing up data...")
     snapshot = {
         "failures": dict(failures, total=failure_total["count"]),
         "state": {k: v for k, v in state.items() if k != "message"},
@@ -119,7 +122,9 @@ def record_failure(layer, detail=""):
     failures[layer] += 1
     failure_total["count"] += 1
     total = failure_total["count"]
-    print(f"[FORTRESS] {layer.upper()} FAILED ({failures[layer]} in a row, {total} total): {detail}")
+    left = min(MAX_LAYER_FAILURES - failures[layer], MAX_TOTAL_FAILURES - total)
+    print(f"[FORTRESS] {layer.upper()} FAILED ({failures[layer]} in a row, {total} total): {detail}"
+          + (f" — backup after {left} more" if left > 0 else ""))
 
     if failures[layer] >= MAX_LAYER_FAILURES:
         trigger_backup(f"REPEATED {layer.upper()} FAILURES", detail)
@@ -2160,6 +2165,15 @@ if __name__ == "__main__":
     print(
         "LAYER 4 : CARD VERIFICATION"
     )
+
+    print("=" * 60)
+
+    print("INTRUSION BACKUP: ARMED")
+    print("  Data backed up from :", PROTECTED_DATA_DIR)
+    print("  Backups saved to    :", BACKUP_DIR)
+    print(f"  Triggers            : {MAX_LAYER_FAILURES} failures in a row on one layer, "
+          f"{MAX_TOTAL_FAILURES} in total, or the final sequence typed on the phone")
+    PROTECTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
 
