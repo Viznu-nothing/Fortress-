@@ -67,6 +67,7 @@ BACKUP_COOLDOWN_SECONDS = 30
 failures = {"face": 0, "palm": 0, "password": 0}   # in a row, per layer
 failure_total = {"count": 0}   # all layers; cleared only by a backup or a full unlock
 last_backup_time = {}
+backup_events = []   # read by the laptop HUD via /backup_events
 BACKUP_LOCK = threading.Lock()
 
 
@@ -94,8 +95,12 @@ def run_backup(trigger, detail, remote_addr, snapshot):
                 json.dumps(incident, indent=2), encoding="utf-8"
             )
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — data backed up to {archive}")
+            backup_events.append({"time": incident["time"], "trigger": trigger, "ok": True,
+                                  "file": Path(archive).name, "folder": str(BACKUP_DIR)})
         except Exception as exc:
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — BACKUP FAILED: {exc}")
+            backup_events.append({"time": datetime.now().isoformat(timespec="seconds"),
+                                  "trigger": trigger, "ok": False, "error": str(exc)})
 
 
 def trigger_backup(trigger, detail=""):
@@ -144,6 +149,15 @@ def clear_failures():
 
 def record_success(layer):
     failures[layer] = 0
+
+
+@app.route("/backup_events")
+def get_backup_events():
+    # Laptop HUD only: the phone must never learn that a backup happened.
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"events": []}), 403
+    return jsonify({"events": backup_events})
+
 
 
 # ============================================================

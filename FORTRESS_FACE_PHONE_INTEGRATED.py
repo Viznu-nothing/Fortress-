@@ -31,6 +31,7 @@ CYAN_DIM = "#0A6D8A"
 WHITE = "#EAF7FF"
 MUTED = "#638391"
 GREEN = "#16E6A0"
+RED = "#FF5268"
 LINE = "#123848"
 
 BASE_W = 1600
@@ -985,6 +986,10 @@ class FortressHUD:
         self.qr_scan_running = False
         self.sequence_active = False
         self.sequence_window = None
+
+        # Intrusion backups reported by the controller
+        self.backups_seen = 0
+        self.security_alert = None
 
         self.root.bind(
             "<F2>",
@@ -2142,12 +2147,14 @@ class FortressHUD:
             anchor="w"
         )
 
+        alert = self.security_alert
+
         self.text(
             left + 25,
             248,
-            "SECURE",
+            "ALERT" if alert else "SECURE",
             size=26,
-            fill=GREEN,
+            fill=RED if alert else GREEN,
             anchor="w",
             bold=True
         )
@@ -2186,19 +2193,19 @@ class FortressHUD:
             gy - 46,
             gx + 46,
             gy + 46,
-            start=135,
-            extent=90,
+            start=135 if not alert else -45,
+            extent=90 if not alert else 270,
             style=tk.ARC,
-            outline=GREEN,
+            outline=RED if alert else GREEN,
             width=5
         )
 
         self.text(
             gx,
             gy - 4,
-            "LOW",
+            "HIGH" if alert else "LOW",
             size=13,
-            fill=GREEN,
+            fill=RED if alert else GREEN,
             bold=True
         )
 
@@ -2248,32 +2255,30 @@ class FortressHUD:
             bold=True
         )
 
-        self.text(
-            left + 25,
-            462,
-            "FORTRESS is secure.",
-            size=9,
-            fill=WHITE,
-            anchor="w"
-        )
+        if alert:
+            analysis = [
+                ("Unauthorized access detected.", RED),
+                ("Protected data backed up:" if alert.get("ok") else "Data backup FAILED.", WHITE),
+                (alert.get("file", alert.get("error", ""))[:30], MUTED),
+                (alert.get("trigger", "").title()[:30], MUTED),
+            ]
+        else:
+            analysis = [
+                ("FORTRESS is secure.", WHITE),
+                ("Awaiting the next", MUTED),
+                ("authorization event.", MUTED),
+            ]
 
-        self.text(
-            left + 25,
-            490,
-            "Awaiting the next",
-            size=9,
-            fill=MUTED,
-            anchor="w"
-        )
+        for index, (line_text, line_color) in enumerate(analysis):
 
-        self.text(
-            left + 25,
-            513,
-            "authorization event.",
-            size=9,
-            fill=MUTED,
-            anchor="w"
-        )
+            self.text(
+                left + 25,
+                462 + index * 25,
+                line_text,
+                size=9,
+                fill=line_color,
+                anchor="w"
+            )
 
     # ========================================================
     # EVENT LOG
@@ -2365,6 +2370,12 @@ class FortressHUD:
                     "PASSED",
                     "INITIALIZED",
                     "AUTHORIZED"
+                )
+                else RED
+                if status in (
+                    "FAILED",
+                    "BACKED UP",
+                    "BACKUP FAILED"
                 )
                 else MUTED
             )
@@ -3346,6 +3357,13 @@ $synth.Dispose()
                 elif vault_status == "LOCKED" and state["VAULT"] == "AUTHORIZED":
                     state["VAULT"] = "LOCKED"
                     self.request_rebuild()
+
+            backup_response = requests.get(CONTROLLER_URL + "/backup_events", timeout=0.35)
+            if backup_response.ok:
+                backup_list = backup_response.json().get("events", [])
+                for backup_event in backup_list[self.backups_seen:]:
+                    self.on_backup_event(backup_event)
+                self.backups_seen = len(backup_list)
         except (requests.RequestException, ValueError, TypeError):
             # Phone controller may not be started yet; keep the HUD and NEXUS running.
             pass
@@ -3652,9 +3670,94 @@ $synth.Dispose()
             return
 
         state["VAULT"] = "AUTHORIZED"
+        self.security_alert = None
 
         events.append((datetime.now().strftime("%H:%M:%S"), "PHYSICAL VAULT", "AUTHORIZED"))
         self.request_rebuild()
+
+    # ========================================================
+    # INTRUSION BACKUP ALERT (laptop only)
+    # ========================================================
+
+    def on_backup_event(
+        self,
+        backup_event
+    ):
+
+        self.security_alert = backup_event
+        ok = backup_event.get("ok")
+        trigger = backup_event.get("trigger", "UNAUTHORIZED ACCESS")
+
+        events.append((
+            datetime.now().strftime("%H:%M:%S"),
+            "UNAUTHORIZED ACCESS",
+            "BACKED UP" if ok else "BACKUP FAILED"
+        ))
+
+        if ok:
+            message = (
+                f"ALERT: unauthorized access detected ({trigger.lower()}). "
+                f"Protected data backed up to {backup_event.get('file')}."
+            )
+        else:
+            message = (
+                f"ALERT: unauthorized access detected ({trigger.lower()}). "
+                f"Data backup failed: {backup_event.get('error')}"
+            )
+
+        self.add_chat_message("NEXUS", message, RED)
+        self.request_rebuild()
+        self.show_backup_alert(backup_event)
+
+    def show_backup_alert(
+        self,
+        backup_event
+    ):
+
+        window = tk.Toplevel(self.root)
+        window.overrideredirect(True)
+        window.configure(bg=RED)
+        window.attributes("-topmost", True)
+
+        width = max(420, int(760 * self.scale))
+        height = max(150, int(210 * self.scale))
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + int(self.offset_y + 140 * self.scale)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+        inner = tk.Frame(window, bg="#1A0509")
+        inner.pack(fill="both", expand=True, padx=3, pady=3)
+
+        tk.Label(
+            inner,
+            text="UNAUTHORIZED ACCESS DETECTED",
+            bg="#1A0509",
+            fg=RED,
+            font=("Segoe UI", max(14, int(24 * self.scale)), "bold")
+        ).pack(pady=(int(28 * self.scale), 6))
+
+        if backup_event.get("ok"):
+            detail = f"DATA BACKED UP  //  {backup_event.get('file')}"
+        else:
+            detail = f"DATA BACKUP FAILED  //  {backup_event.get('error')}"
+
+        tk.Label(
+            inner,
+            text=detail,
+            bg="#1A0509",
+            fg=WHITE,
+            font=("Segoe UI", max(9, int(12 * self.scale)), "bold")
+        ).pack()
+
+        tk.Label(
+            inner,
+            text=backup_event.get("trigger", ""),
+            bg="#1A0509",
+            fg=MUTED,
+            font=("Segoe UI", max(8, int(10 * self.scale)))
+        ).pack(pady=(4, 0))
+
+        self.root.after(5000, window.destroy)
 
     # ========================================================
     # AUTHENTICATION STATE
