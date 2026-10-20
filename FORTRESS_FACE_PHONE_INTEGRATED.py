@@ -2,6 +2,7 @@ import tkinter as tk
 import math
 import threading
 import os
+import subprocess
 import time
 import random
 import re
@@ -1090,6 +1091,14 @@ class FortressHUD:
         self.root.bind(
             "<F2>",
             self.start_face_verification
+        )
+
+        # F3 opens the folder with the latest intrusion backup.
+        self.latest_backup = None
+
+        self.root.bind(
+            "<F3>",
+            self.open_latest_backup
         )
 
         # ====================================================
@@ -3779,6 +3788,8 @@ $synth.Dispose()
     ):
 
         self.security_alert = backup_event
+        if backup_event.get("ok"):
+            self.latest_backup = backup_event
         ok = backup_event.get("ok")
         trigger = backup_event.get("trigger", "UNAUTHORIZED ACCESS")
 
@@ -3791,7 +3802,8 @@ $synth.Dispose()
         if ok:
             message = (
                 f"ALERT: unauthorized access detected ({trigger.lower()}). "
-                f"Protected data backed up to {backup_event.get('file')}."
+                f"Protected data backed up to {backup_event.get('path') or backup_event.get('file')}. "
+                f"Press F3 to open the backup folder."
             )
         else:
             message = (
@@ -3814,7 +3826,7 @@ $synth.Dispose()
         window.attributes("-topmost", True)
 
         width = max(420, int(760 * self.scale))
-        height = max(150, int(210 * self.scale))
+        height = max(240, int(320 * self.scale))
         x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
         y = self.root.winfo_rooty() + int(self.offset_y + 140 * self.scale)
         window.geometry(f"{width}x{height}+{x}+{y}")
@@ -3851,7 +3863,72 @@ $synth.Dispose()
             font=("Segoe UI", max(8, int(10 * self.scale)))
         ).pack(pady=(4, 0))
 
-        self.root.after(5000, window.destroy)
+        if backup_event.get("ok"):
+
+            tk.Label(
+                inner,
+                text="SAVED IN: " + str(backup_event.get("folder", "")),
+                bg="#1A0509",
+                fg=WHITE,
+                wraplength=width - 40,
+                font=("Segoe UI", max(8, int(9 * self.scale)))
+            ).pack(pady=(6, 0))
+
+            def open_and_close():
+                self.open_backup(backup_event)
+                window.destroy()
+
+            tk.Button(
+                inner,
+                text="OPEN BACKUP FOLDER  (F3)",
+                command=open_and_close,
+                bg="#3A0D14",
+                fg=WHITE,
+                activebackground=RED,
+                activeforeground=WHITE,
+                relief="flat",
+                bd=0,
+                padx=14,
+                pady=4,
+                font=("Segoe UI", max(8, int(10 * self.scale)), "bold")
+            ).pack(pady=(8, 0))
+
+        def close_popup():
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+        self.root.after(10000, close_popup)
+
+    def open_latest_backup(
+        self,
+        event=None
+    ):
+
+        if self.latest_backup:
+            self.open_backup(self.latest_backup)
+        else:
+            self.add_chat_message("NEXUS", "No intrusion backup has been made yet.", CYAN)
+
+    def open_backup(
+        self,
+        backup_event
+    ):
+        """Open File Explorer on the backup folder with the zip selected."""
+
+        path = backup_event.get("path")
+        folder = backup_event.get("folder")
+
+        try:
+            if os.name == "nt" and path and os.path.exists(path):
+                subprocess.Popen(f'explorer /select,"{path}"')
+            elif os.name == "nt" and folder:
+                os.startfile(folder)
+            else:
+                print("Backup folder:", folder)
+        except Exception as error:
+            print("Could not open backup folder:", error)
 
     # ========================================================
     # AUTHENTICATION STATE

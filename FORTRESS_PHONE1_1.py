@@ -96,7 +96,8 @@ def run_backup(trigger, detail, remote_addr, snapshot):
             )
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — data backed up to {archive}")
             backup_events.append({"time": incident["time"], "trigger": trigger, "ok": True,
-                                  "file": Path(archive).name, "folder": str(BACKUP_DIR)})
+                                  "file": Path(archive).name, "folder": str(BACKUP_DIR),
+                                  "path": str(Path(archive).resolve())})
         except Exception as exc:
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — BACKUP FAILED: {exc}")
             backup_events.append({"time": datetime.now().isoformat(timespec="seconds"),
