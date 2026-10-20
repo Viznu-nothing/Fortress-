@@ -1559,139 +1559,42 @@ def face_denied():
 
 
 # ============================================================
-# USER'S PALM VERIFICATION ALGORITHM — laptop webcam
-# Uses hand_landmarker.task + face_data/enrolled_palm.pkl
+# PALM VERIFICATION — runs in the laptop HUD
+# The HUD (FORTRESS_FACE_PHONE_INTEGRATED.py) polls /state, starts the
+# palm scan when it sees palm=SCANNING, and reports back via
+# /palm_verified or /palm_denied.
 # ============================================================
-PALM_SCAN_LOCK = threading.Lock()
-PALM_SCAN_THREAD = None
 BASE_DIR = Path(__file__).resolve().parent
-
-
-def run_user_palm_verification():
-    """Run the uploaded palm_verify_test.py algorithm on the laptop webcam."""
-    global PALM_SCAN_THREAD
-    camera = None
-    landmarker = None
-    try:
-        import mediapipe as mp
-        model_path = BASE_DIR / "hand_landmarker.task"
-        profile_path = BASE_DIR / "face_data" / "enrolled_palm.pkl"
-        if not model_path.exists():
-            state.update(palm="FAILED", palm_verified=False, message="PALM SCAN ERROR: hand_landmarker.task NOT FOUND")
-            return
-        if not profile_path.exists():
-            state.update(palm="FAILED", palm_verified=False, message="PALM SCAN ERROR: face_data/enrolled_palm.pkl NOT FOUND")
-            return
-        with open(profile_path, "rb") as f:
-            profile = pickle.load(f)
-        enrolled_template = np.asarray(profile["template"], dtype=np.float32)
-        options = mp.tasks.vision.HandLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            num_hands=1,
-            min_hand_detection_confidence=0.65,
-            min_hand_presence_confidence=0.65,
-            min_tracking_confidence=0.65,
-        )
-        landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
-        camera = cv2.VideoCapture(0)
-        if not camera.isOpened():
-            state.update(palm="FAILED", palm_verified=False, message="PALM SCAN ERROR: LAPTOP WEBCAM COULD NOT OPEN")
-            return
-        state.update(palm="SCANNING", palm_verified=False, message="PALM SCANNING ON LAPTOP WEBCAM")
-        start_time = time.time()
-        scores = []
-        consecutive_matches = 0
-        verified = False
-        MATCH_THRESHOLD = 0.985
-        REQUIRED_MATCHES = 8
-        while True:
-            ret, frame = camera.read()
-            if not ret:
-                state.update(palm="FAILED", palm_verified=False, message="PALM SCAN ERROR: CAMERA FRAME UNAVAILABLE")
-                return
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.time() - start_time) * 1000)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
-            status = "SEARCHING FOR PALM"
-            score_text = "MATCH: --"
-            if result.hand_landmarks:
-                hand = result.hand_landmarks[0]
-                points = np.asarray([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
-                points -= points[0].copy()
-                scale = np.linalg.norm(points[9])
-                if scale > 1e-6:
-                    points /= scale
-                    live_vector = points.flatten()
-                    norm = np.linalg.norm(live_vector)
-                    if norm > 1e-6:
-                        live_vector = live_vector / norm
-                        similarity = float(np.dot(enrolled_template, live_vector))
-                        similarity = max(-1.0, min(1.0, similarity))
-                        scores.append(similarity)
-                        if len(scores) > 10: scores.pop(0)
-                        average_score = float(np.mean(scores))
-                        score_text = f"MATCH: {average_score:.4f}"
-                        if average_score >= MATCH_THRESHOLD:
-                            consecutive_matches += 1
-                            status = f"PALM MATCHING {consecutive_matches}/{REQUIRED_MATCHES}"
-                        else:
-                            consecutive_matches = 0
-                            status = "PALM DETECTED — NO MATCH"
-                        if consecutive_matches >= REQUIRED_MATCHES:
-                            verified = True
-                            status = "PALM VERIFIED"
-                h, w = frame.shape[:2]
-                for lm in hand:
-                    cv2.circle(frame, (int(lm.x*w), int(lm.y*h)), 4, (0,220,255), -1)
-                connections = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),(13,17),(17,18),(18,19),(19,20),(0,17)]
-                for a,b in connections:
-                    cv2.line(frame, (int(hand[a].x*w),int(hand[a].y*h)), (int(hand[b].x*w),int(hand[b].y*h)), (0,180,255), 2)
-            else:
-                consecutive_matches = 0
-                scores.clear()
-                status = "NO PALM DETECTED"
-            cv2.putText(frame, "FORTRESS PALM VERIFICATION", (20,35), cv2.FONT_HERSHEY_SIMPLEX, .8, (0,220,255), 2)
-            cv2.putText(frame, status, (20,75), cv2.FONT_HERSHEY_SIMPLEX, .7, (255,255,255), 2)
-            cv2.putText(frame, score_text, (20,110), cv2.FONT_HERSHEY_SIMPLEX, .65, (180,220,230), 2)
-            cv2.putText(frame, "Press Q to exit", (20,145), cv2.FONT_HERSHEY_SIMPLEX, .55, (150,180,190), 2)
-            cv2.imshow("FORTRESS - Palm Verification", frame)
-            if verified:
-                state.update(palm="VERIFIED", palm_verified=True, password="ACTIVE", password_verified=False,
-                             security_code="LOCKED", security_code_verified=False, vault="LOCKED",
-                             message="PALM VERIFIED // PHONE PIN REQUIRED")
-                cv2.waitKey(1200)
-                return
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                state.update(palm="FAILED", palm_verified=False, password="LOCKED", security_code="LOCKED",
-                             vault="LOCKED", message="PALM VERIFICATION CANCELLED")
-                return
-    except Exception as exc:
-        state.update(palm="FAILED", palm_verified=False, message=f"PALM SCAN ERROR: {type(exc).__name__}: {exc}")
-    finally:
-        if camera is not None:
-            camera.release()
-        cv2.destroyAllWindows()
-        if landmarker is not None:
-            landmarker.close()
-        PALM_SCAN_LOCK.release()
 
 
 @app.route("/palm_request", methods=["POST"])
 def palm_request():
-    global PALM_SCAN_THREAD
     if not state.get("face_verified"):
         state["message"] = "FACE VERIFICATION REQUIRED"
         return jsonify(state), 403
-    if not PALM_SCAN_LOCK.acquire(blocking=False):
-        state["message"] = "PALM SCAN ALREADY RUNNING ON LAPTOP"
-        return jsonify(state), 409
-    state.update(palm="SCANNING", palm_verified=False, message="OPENING LAPTOP WEBCAM FOR PALM VERIFICATION")
-    PALM_SCAN_THREAD = threading.Thread(target=run_user_palm_verification, daemon=True)
-    PALM_SCAN_THREAD.start()
+    state.update(palm="SCANNING", palm_verified=False,
+                 message="OPENING LAPTOP WEBCAM FOR PALM VERIFICATION")
     return jsonify(state), 202
+
+
+@app.route("/palm_verified", methods=["POST"])
+def palm_verified():
+    if not state.get("face_verified"):
+        state["message"] = "FACE VERIFICATION REQUIRED"
+        return jsonify(state), 403
+    state.update(palm="VERIFIED", palm_verified=True, password="ACTIVE", password_verified=False,
+                 security_code="LOCKED", security_code_verified=False, vault="LOCKED",
+                 message="PALM VERIFIED // PHONE PIN REQUIRED")
+    return jsonify(state)
+
+
+@app.route("/palm_denied", methods=["POST"])
+def palm_denied():
+    data = request.get_json(silent=True) or {}
+    state.update(palm="FAILED", palm_verified=False, password="LOCKED", password_verified=False,
+                 security_code="LOCKED", security_code_verified=False, vault="LOCKED",
+                 message=str(data.get("message") or "PALM VERIFICATION FAILED"))
+    return jsonify(state)
 
 
 def extract_palm_features(image):

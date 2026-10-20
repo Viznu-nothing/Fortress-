@@ -10,6 +10,7 @@ import speech_recognition as sr
 import pyttsx3
 import numpy as np
 import cv2
+import pickle
 
 from openai import OpenAI
 from datetime import datetime
@@ -515,6 +516,191 @@ def run_face_verification():
     return result
 
 
+# ============================================================
+# PALM VERIFICATION — laptop webcam (from palm_verify_test.py)
+# Uses hand_landmarker.task + face_data/enrolled_palm.pkl
+# ============================================================
+
+PALM_MODEL_FILE = "hand_landmarker.task"
+PALM_PROFILE_FILE = os.path.join("face_data", "enrolled_palm.pkl")
+PALM_WINDOW_NAME = "FORTRESS - Palm Verification"
+
+MATCH_THRESHOLD = 0.985
+REQUIRED_MATCHES = 8
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
+]
+
+
+def find_palm_files():
+    # Same folders as the face models.
+    for folder in FACE_MODEL_DIRS:
+        model_path = os.path.join(folder, PALM_MODEL_FILE)
+        profile_path = os.path.join(folder, PALM_PROFILE_FILE)
+        if os.path.isfile(model_path) and os.path.isfile(profile_path):
+            return model_path, profile_path
+    return None, None
+
+
+def run_palm_verification():
+    """
+    Run live palm verification on the laptop webcam.
+    Returns "VERIFIED", "CANCELLED" (Q pressed) or "ERROR: <reason>".
+    """
+    import mediapipe as mp
+
+    model_path, profile_path = find_palm_files()
+
+    if model_path is None:
+        return "ERROR: hand_landmarker.task / face_data/enrolled_palm.pkl not found"
+
+    # Load enrolled biometric profile
+    with open(profile_path, "rb") as f:
+        profile = pickle.load(f)
+
+    enrolled_template = np.asarray(profile["template"], dtype=np.float32)
+
+    # MediaPipe Tasks API
+    options = mp.tasks.vision.HandLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.65,
+        min_hand_presence_confidence=0.65,
+        min_tracking_confidence=0.65
+    )
+
+    landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
+
+    camera = cv2.VideoCapture(0)
+
+    if not camera.isOpened():
+        landmarker.close()
+        return "ERROR: could not open webcam"
+
+    print()
+    print("=" * 60)
+    print("FORTRESS — PALM BIOMETRIC VERIFICATION")
+    print("=" * 60)
+    print("Show the SAME palm that was enrolled. Press Q to quit.")
+
+    start_time = time.time()
+    scores = []
+    consecutive_matches = 0
+    verified = False
+    result_text = "CANCELLED"
+
+    try:
+        while True:
+            ret, frame = camera.read()
+
+            if not ret:
+                result_text = "ERROR: camera frame unavailable"
+                break
+
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int((time.time() - start_time) * 1000)
+
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+            status = "SEARCHING FOR PALM"
+            score_text = "MATCH: --"
+
+            if result.hand_landmarks:
+                hand = result.hand_landmarks[0]
+
+                # Extract 21 landmarks, normalize relative to wrist and scale
+                points = np.asarray(
+                    [[lm.x, lm.y, lm.z] for lm in hand],
+                    dtype=np.float32
+                )
+                points -= points[0].copy()
+                scale = np.linalg.norm(points[9])
+
+                if scale > 1e-6:
+                    points /= scale
+                    live_vector = points.flatten()
+                    norm = np.linalg.norm(live_vector)
+
+                    if norm > 1e-6:
+                        live_vector = live_vector / norm
+
+                        # Cosine similarity
+                        similarity = float(np.dot(enrolled_template, live_vector))
+                        similarity = max(-1.0, min(1.0, similarity))
+
+                        scores.append(similarity)
+                        if len(scores) > 10:
+                            scores.pop(0)
+
+                        average_score = float(np.mean(scores))
+                        score_text = f"MATCH: {average_score:.4f}"
+
+                        if average_score >= MATCH_THRESHOLD:
+                            consecutive_matches += 1
+                            status = f"PALM MATCHING {consecutive_matches}/{REQUIRED_MATCHES}"
+                        else:
+                            consecutive_matches = 0
+                            status = "PALM DETECTED — NO MATCH"
+
+                        if consecutive_matches >= REQUIRED_MATCHES:
+                            verified = True
+                            status = "PALM VERIFIED"
+
+                    # Draw landmarks
+                    h, w = frame.shape[:2]
+
+                    for lm in hand:
+                        cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 4, (0, 220, 255), -1)
+
+                    for a, b in HAND_CONNECTIONS:
+                        cv2.line(
+                            frame,
+                            (int(hand[a].x * w), int(hand[a].y * h)),
+                            (int(hand[b].x * w), int(hand[b].y * h)),
+                            (0, 180, 255),
+                            2
+                        )
+
+            else:
+                consecutive_matches = 0
+                scores.clear()
+                status = "NO PALM DETECTED"
+
+            cv2.putText(frame, "FORTRESS PALM VERIFICATION", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2)
+            cv2.putText(frame, status, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, score_text, (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 220, 230), 2)
+            cv2.putText(frame, "Press Q to exit", (20, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 180, 190), 2)
+
+            cv2.imshow(PALM_WINDOW_NAME, frame)
+
+            # Stop after successful verification
+            if verified:
+                print("PALM VERIFIED — live palm matches enrolled biometric profile.")
+                result_text = "VERIFIED"
+                cv2.waitKey(1500)
+                break
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("Palm verification cancelled.")
+                break
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+        landmarker.close()
+
+    return result_text
+
+
 class FortressHUD:
 
     def __init__(self, root):
@@ -608,6 +794,7 @@ class FortressHUD:
         # ====================================================
 
         self.face_scan_running = False
+        self.palm_scan_running = False
 
         self.root.bind(
             "<F2>",
@@ -2854,6 +3041,10 @@ $synth.Dispose()
                 if face_status == "SCANNING" and not self.face_scan_running:
                     self.start_face_verification()
 
+                # Phone tapped SCAN PALM: run the palm scan on this laptop.
+                if palm_status == "SCANNING" and not self.palm_scan_running:
+                    self.start_palm_verification()
+
                 # Mirror real controller results into the laptop HUD.
                 if face_status in ("VERIFIED", "PASSED") and state.get("FACE VERIFICATION") != "PASSED":
                     self.face_pass()
@@ -2957,6 +3148,71 @@ $synth.Dispose()
             state["PHONE PIN"] = "LOCKED"
             state["CARD VERIFICATION"] = "LOCKED"
             events.append((datetime.now().strftime("%H:%M:%S"), "FACE VERIFICATION", "FAILED"))
+            self.request_rebuild()
+
+    # ========================================================
+    # PALM VERIFICATION — LAPTOP WEBCAM
+    # ========================================================
+
+    def start_palm_verification(self):
+
+        if self.palm_scan_running or self.face_scan_running:
+            return
+
+        self.palm_scan_running = True
+
+        state["PALM VERIFICATION"] = "SCANNING"
+        events.append((datetime.now().strftime("%H:%M:%S"), "PALM VERIFICATION", "SCANNING"))
+        self.request_rebuild()
+
+        threading.Thread(
+            target=self.palm_verification_worker,
+            daemon=True
+        ).start()
+
+    def palm_verification_worker(self):
+
+        try:
+            result = run_palm_verification()
+        except Exception as error:
+            result = f"ERROR: {type(error).__name__}: {error}"
+
+        print("PALM VERIFICATION RESULT:", result)
+
+        if result == "VERIFIED":
+            notify_controller("/palm_verified")
+        else:
+            message = (
+                "PALM VERIFICATION CANCELLED"
+                if result == "CANCELLED"
+                else f"PALM SCAN {result.upper()}"
+            )
+            try:
+                requests.post(
+                    CONTROLLER_URL + "/palm_denied",
+                    json={"message": message},
+                    timeout=1.5
+                )
+            except Exception:
+                pass
+
+        self.root.after(0, self.palm_verification_done, result == "VERIFIED")
+
+    def palm_verification_done(
+        self,
+        verified
+    ):
+
+        self.palm_scan_running = False
+
+        if verified:
+            if state.get("PALM VERIFICATION") != "PASSED":
+                self.palm_pass()
+        elif state.get("PALM VERIFICATION") != "FAILED":
+            state["PALM VERIFICATION"] = "FAILED"
+            state["PHONE PIN"] = "LOCKED"
+            state["CARD VERIFICATION"] = "LOCKED"
+            events.append((datetime.now().strftime("%H:%M:%S"), "PALM VERIFICATION", "FAILED"))
             self.request_rebuild()
 
     # ========================================================
