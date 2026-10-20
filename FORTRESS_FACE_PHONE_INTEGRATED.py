@@ -14,6 +14,7 @@ import numpy as np
 import cv2
 import pickle
 
+import openai
 from openai import OpenAI
 from datetime import datetime
 
@@ -887,6 +888,29 @@ def run_qr_verification():
     finally:
         camera.release()
         cv2.destroyAllWindows()
+
+
+def describe_openai_error(error):
+    """Short, plain reason for an OpenAI failure, shown in the NEXUS chat."""
+    text = str(error).lower()
+
+    if isinstance(error, getattr(openai, "AuthenticationError", ())):
+        return "the OpenAI API key was rejected. Check OPENAI_API_KEY."
+    if isinstance(error, getattr(openai, "PermissionDeniedError", ())):
+        return "this API key is not allowed to use the model."
+    if isinstance(error, getattr(openai, "RateLimitError", ())):
+        if "quota" in text or "billing" in text:
+            return "the OpenAI account has no credit left. Check billing."
+        return "too many requests. Wait a moment and try again."
+    if isinstance(error, getattr(openai, "NotFoundError", ())):
+        return "the model name was not found for this API key."
+    if isinstance(error, (getattr(openai, "APIConnectionError", ()),
+                          getattr(openai, "APITimeoutError", ()))):
+        return "no internet connection to OpenAI."
+    if isinstance(error, getattr(openai, "BadRequestError", ())):
+        return "OpenAI rejected the request (" + str(error)[:80] + ")."
+
+    return type(error).__name__ + ": " + str(error)[:80]
 
 
 class FortressHUD:
@@ -2618,11 +2642,13 @@ Respond as NEXUS.
 
             print(
                 "NEXUS OpenAI error:",
+                type(error).__name__,
                 error
             )
 
             return (
-                "NEXUS AI connection unavailable."
+                "NEXUS AI connection unavailable: "
+                + describe_openai_error(error)
             )
 
     # ========================================================
