@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 fortress_backups/
 protected_data/
+gemini_key.txt

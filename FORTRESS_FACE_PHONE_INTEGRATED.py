@@ -14,8 +14,8 @@ import numpy as np
 import cv2
 import pickle
 
-import openai
-from openai import OpenAI
+from google import genai
+from google.genai import types as genai_types
 from datetime import datetime
 
 
@@ -123,10 +123,82 @@ except Exception as error:
 
 
 # ============================================================
-# NEXUS AI — OPENAI
+# NEXUS AI — GOOGLE GEMINI
+#
+# API key: set the GEMINI_API_KEY environment variable, or put the
+# key alone in a file called gemini_key.txt next to this script.
+#
+# Gemini model names change often, so NEXUS tries these in order and
+# keeps the first one the key can use. Set GEMINI_MODEL to force one.
 # ============================================================
 
-OPENAI_CLIENT = OpenAI()
+GEMINI_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+]
+
+# Room for the model's own thinking plus a short spoken answer.
+GEMINI_MAX_OUTPUT_TOKENS = 1024
+
+_gemini_client = None
+_gemini_model = os.environ.get("GEMINI_MODEL") or None
+
+
+def get_gemini_key():
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if key:
+        return key.strip()
+    key_file = os.path.join(CURRENT_FOLDER, "gemini_key.txt")
+    if os.path.isfile(key_file):
+        with open(key_file, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    return None
+
+
+def get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        key = get_gemini_key()
+        if not key:
+            raise RuntimeError("NO_GEMINI_KEY")
+        _gemini_client = genai.Client(api_key=key)
+    return _gemini_client
+
+
+def ask_gemini(prompt):
+    """Return Gemini's answer text. Tries the model list until one works."""
+    global _gemini_model
+    client = get_gemini_client()
+    config = genai_types.GenerateContentConfig(
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        temperature=0.4,
+    )
+
+    models = [_gemini_model] if _gemini_model else GEMINI_MODELS
+    last_error = None
+
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception as error:
+            # Unknown model for this key: try the next one.
+            if getattr(error, "code", None) == 404 and not _gemini_model:
+                last_error = error
+                continue
+            raise
+
+        if not _gemini_model:
+            _gemini_model = model
+            print("NEXUS AI: using Gemini model", model)
+
+        return (response.text or "").strip()
+
+    raise last_error
 
 CURRENT_FOLDER = os.path.dirname(
     os.path.abspath(__file__)
@@ -890,25 +962,25 @@ def run_qr_verification():
         cv2.destroyAllWindows()
 
 
-def describe_openai_error(error):
-    """Short, plain reason for an OpenAI failure, shown in the NEXUS chat."""
+def describe_ai_error(error):
+    """Short, plain reason for a Gemini failure, shown in the NEXUS chat."""
     text = str(error).lower()
+    code = getattr(error, "code", None)
 
-    if isinstance(error, getattr(openai, "AuthenticationError", ())):
-        return "the OpenAI API key was rejected. Check OPENAI_API_KEY."
-    if isinstance(error, getattr(openai, "PermissionDeniedError", ())):
-        return "this API key is not allowed to use the model."
-    if isinstance(error, getattr(openai, "RateLimitError", ())):
-        if "quota" in text or "billing" in text:
-            return "the OpenAI account has no credit left. Check billing."
-        return "too many requests. Wait a moment and try again."
-    if isinstance(error, getattr(openai, "NotFoundError", ())):
-        return "the model name was not found for this API key."
-    if isinstance(error, (getattr(openai, "APIConnectionError", ()),
-                          getattr(openai, "APITimeoutError", ()))):
-        return "no internet connection to OpenAI."
-    if isinstance(error, getattr(openai, "BadRequestError", ())):
-        return "OpenAI rejected the request (" + str(error)[:80] + ")."
+    if str(error) == "NO_GEMINI_KEY":
+        return "no Gemini API key. Put it in gemini_key.txt next to the HUD file."
+    if "api key not valid" in text or "api_key_invalid" in text or code == 401:
+        return "the Gemini API key was rejected. Check gemini_key.txt."
+    if code == 403:
+        return "this Gemini API key is not allowed to use the model."
+    if code == 429:
+        return "Gemini quota used up. Wait a minute or check the API plan."
+    if code == 404:
+        return "no Gemini model in the list is available for this key."
+    if code is not None and code >= 500:
+        return "Gemini is having problems right now. Try again shortly."
+    if any(word in text for word in ("connect", "timed out", "timeout", "getaddrinfo", "network")):
+        return "no internet connection to Gemini."
 
     return type(error).__name__ + ": " + str(error)[:80]
 
@@ -2485,7 +2557,7 @@ class FortressHUD:
         )
 
         threading.Thread(
-            target=self.ask_openai,
+            target=self.ask_nexus,
             args=(message,),
             daemon=True
         ).start()
@@ -2622,13 +2694,9 @@ Respond as NEXUS.
 
         try:
 
-            response = OPENAI_CLIENT.responses.create(
-                model="gpt-6-luna",
-                input=prompt,
-                max_output_tokens=120
+            answer = ask_gemini(
+                prompt
             )
-
-            answer = response.output_text.strip()
 
             if not answer:
 
@@ -2641,21 +2709,21 @@ Respond as NEXUS.
         except Exception as error:
 
             print(
-                "NEXUS OpenAI error:",
+                "NEXUS Gemini error:",
                 type(error).__name__,
                 error
             )
 
             return (
                 "NEXUS AI connection unavailable: "
-                + describe_openai_error(error)
+                + describe_ai_error(error)
             )
 
     # ========================================================
     # NEXUS — TEXT CHAT
     # ========================================================
 
-    def ask_openai(
+    def ask_nexus(
         self,
         message
     ):
