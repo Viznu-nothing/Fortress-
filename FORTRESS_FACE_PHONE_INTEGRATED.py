@@ -3,6 +3,8 @@ import math
 import threading
 import os
 import time
+import random
+import re
 import requests
 
 import sounddevice as sd
@@ -46,6 +48,7 @@ state = {
     "PALM VERIFICATION": "LOCKED",
     "PHONE PIN": "LOCKED",
     "CARD VERIFICATION": "LOCKED",
+    "VAULT": "LOCKED",
 }
 
 events = [
@@ -158,7 +161,24 @@ except Exception:
 
 
 # ============================================================
-# FACE VERIFICATION — laptop webcam (from face_verify_test.py)
+# FINAL SEQUENCE STAGE (hidden — never named in the interface)
+# After the QR passes, 6 random symbols flash on the laptop for
+# 3 seconds. Typing them on the phone is always rejected; only the
+# spoken secret phrase unlocks the vault.
+# ============================================================
+
+SEQUENCE_SYMBOLS = "?@#&*%$!+=<>~^"
+SEQUENCE_LENGTH = 6
+SEQUENCE_FLASH_MS = 3000
+
+
+def is_secret_phrase(text):
+    """Match "i want to eat your pancreas", tolerant of speech-to-text noise."""
+    words = re.sub(r"[^a-z ]", " ", text.lower()).split()
+    joined = " ".join(words)
+    return "pancreas" in words and ("eat your" in joined or "want to eat" in joined)
+
+
 #
 # YuNet       -> face detection
 # MiniFASNet  -> presentation attack / spoof detection
@@ -924,6 +944,8 @@ class FortressHUD:
         self.face_scan_running = False
         self.palm_scan_running = False
         self.qr_scan_running = False
+        self.sequence_active = False
+        self.sequence_window = None
 
         self.root.bind(
             "<F2>",
@@ -2162,9 +2184,9 @@ class FortressHUD:
         self.text(
             left + 170,
             360,
-            "LOCKED",
+            "AUTHORIZED" if state["VAULT"] == "AUTHORIZED" else "LOCKED",
             size=15,
-            fill=CYAN,
+            fill=GREEN if state["VAULT"] == "AUTHORIZED" else CYAN,
             anchor="w",
             bold=True
         )
@@ -2302,7 +2324,8 @@ class FortressHUD:
                 GREEN
                 if status in (
                     "PASSED",
-                    "INITIALIZED"
+                    "INITIALIZED",
+                    "AUTHORIZED"
                 )
                 else MUTED
             )
@@ -2371,6 +2394,15 @@ class FortressHUD:
             0,
             "end"
         )
+
+        if self.check_secret_phrase(message):
+
+            threading.Thread(
+                target=self.unlock_vault,
+                daemon=True
+            ).start()
+
+            return
 
         self.add_chat_message(
             "YOU",
@@ -2443,6 +2475,7 @@ FACE VERIFICATION: {state["FACE VERIFICATION"]}
 PALM VERIFICATION: {state["PALM VERIFICATION"]}
 PHONE PIN: {state["PHONE PIN"]}
 CARD VERIFICATION: {state["CARD VERIFICATION"]}
+PHYSICAL VAULT: {state["VAULT"]}
 """
 
         recent_events = "\n".join(
@@ -2658,6 +2691,15 @@ Respond as NEXUS.
                     "YOU SAID:",
                     spoken_text
                 )
+
+                if self.check_secret_phrase(spoken_text):
+
+                    self.voice_busy = True
+                    self.unlock_vault()
+                    time.sleep(VOICE_RESTART_DELAY)
+                    self.voice_busy = False
+
+                    continue
 
                 self.add_chat_message(
                     "YOU",
@@ -3258,6 +3300,13 @@ $synth.Dispose()
                     state["CARD VERIFICATION"] = "FAILED"
                     events.append((datetime.now().strftime("%H:%M:%S"), "CARD VERIFICATION", "FAILED"))
                     self.request_rebuild()
+
+                vault_status = str(phone_state.get("vault", "")).upper()
+                if vault_status == "AUTHORIZED" and state["VAULT"] != "AUTHORIZED":
+                    self.vault_authorized()
+                elif vault_status == "LOCKED" and state["VAULT"] == "AUTHORIZED":
+                    state["VAULT"] = "LOCKED"
+                    self.request_rebuild()
         except (requests.RequestException, ValueError, TypeError):
             # Phone controller may not be started yet; keep the HUD and NEXUS running.
             pass
@@ -3466,6 +3515,98 @@ $synth.Dispose()
             self.request_rebuild()
 
     # ========================================================
+    # FINAL SEQUENCE STAGE (hidden)
+    # ========================================================
+
+    def flash_sequence(self):
+
+        if self.sequence_window is not None:
+            return
+
+        rng = random.SystemRandom()
+        sequence = "".join(
+            rng.choice(SEQUENCE_SYMBOLS)
+            for _ in range(SEQUENCE_LENGTH)
+        )
+
+        self.sequence_active = True
+
+        window = tk.Toplevel(self.root)
+        window.overrideredirect(True)
+        window.configure(bg=CYAN_DIM)
+        window.attributes("-topmost", True)
+
+        width = max(420, int(900 * self.scale))
+        height = max(180, int(300 * self.scale))
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+        inner = tk.Frame(window, bg="#030A10")
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+
+        tk.Label(
+            inner,
+            text="  ".join(sequence),
+            bg="#030A10",
+            fg=CYAN,
+            font=("Consolas", max(36, int(78 * self.scale)), "bold")
+        ).pack(expand=True)
+
+        self.sequence_window = window
+
+        self.root.after(SEQUENCE_FLASH_MS, self.hide_sequence)
+
+    def hide_sequence(self):
+
+        if self.sequence_window is not None:
+            try:
+                self.sequence_window.destroy()
+            except tk.TclError:
+                pass
+
+    def check_secret_phrase(
+        self,
+        text
+    ):
+
+        return self.sequence_active and is_secret_phrase(text)
+
+    def unlock_vault(self):
+        """Runs off the Tk thread: tell the controller, update the HUD, answer."""
+
+        self.sequence_active = False
+
+        try:
+            requests.post(CONTROLLER_URL + "/sequence_unlock", timeout=1.5)
+        except Exception:
+            pass
+
+        self.root.after(0, self.vault_authorized)
+
+        self.add_chat_message(
+            "NEXUS",
+            "Access authorized.",
+            CYAN
+        )
+
+        self.speak_answer(
+            "Access authorized."
+        )
+
+    def vault_authorized(self):
+
+        self.sequence_active = False
+
+        if state["VAULT"] == "AUTHORIZED":
+            return
+
+        state["VAULT"] = "AUTHORIZED"
+
+        events.append((datetime.now().strftime("%H:%M:%S"), "PHYSICAL VAULT", "AUTHORIZED"))
+        self.request_rebuild()
+
+    # ========================================================
     # AUTHENTICATION STATE
     # ========================================================
 
@@ -3475,6 +3616,10 @@ $synth.Dispose()
         state["PALM VERIFICATION"] = "READY"
         state["PHONE PIN"] = "LOCKED"
         state["CARD VERIFICATION"] = "LOCKED"
+        state["VAULT"] = "LOCKED"
+
+        self.sequence_active = False
+        self.sequence_window = None
 
         events.append((datetime.now().strftime("%H:%M:%S"), "FACE VERIFICATION", "PASSED"))
         self.request_rebuild()
@@ -3502,6 +3647,9 @@ $synth.Dispose()
 
         events.append((datetime.now().strftime("%H:%M:%S"), "CARD VERIFICATION", "PASSED"))
         self.request_rebuild()
+
+        # Flash the sequence once the HUD has redrawn.
+        self.root.after(600, self.flash_sequence)
 
 
 # ============================================================
