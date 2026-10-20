@@ -701,6 +701,134 @@ def run_palm_verification():
     return result_text
 
 
+# ============================================================
+# QR CARD VERIFICATION — laptop webcam, demo-only
+# The QR is NOT decoded or checked. The scan animation always
+# completes; a QR in view just makes the progress run faster.
+# ============================================================
+
+QR_WINDOW_NAME = "FORTRESS - QR Verification"
+DEMO_CARD_OWNER = "VISHNU VARDHAN"
+DEMO_CARD_ID = "FRT-V001"
+
+
+def draw_qr_scan_overlay(frame, progress, status, qr_points, now):
+    h, w = frame.shape[:2]
+    cyan, green, white = (255, 217, 32), (160, 230, 22), (255, 247, 234)
+
+    # Dim everything outside the target box.
+    box = int(min(w, h) * 0.62)
+    x1, y1 = (w - box) // 2, (h - box) // 2
+    x2, y2 = x1 + box, y1 + box
+    shade = (frame * 0.35).astype(np.uint8)
+    shade[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+    frame[:] = shade
+
+    # Corner brackets.
+    arm = box // 7
+    for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
+        cv2.line(frame, (cx, cy), (cx + dx * arm, cy), cyan, 3)
+        cv2.line(frame, (cx, cy), (cx, cy + dy * arm), cyan, 3)
+
+    # Sweeping scan line with a fading trail.
+    sweep = (math.sin(now * 3.0) + 1) / 2
+    line_y = int(y1 + sweep * box)
+    for i in range(12):
+        alpha = 1.0 - i / 12
+        ty = line_y - i * 3 if math.cos(now * 3.0) > 0 else line_y + i * 3
+        if y1 <= ty <= y2:
+            color = tuple(int(c * alpha) for c in cyan)
+            cv2.line(frame, (x1 + 4, ty), (x2 - 4, ty), color, 1)
+    cv2.line(frame, (x1 + 4, line_y), (x2 - 4, line_y), white, 2)
+
+    if qr_points is not None:
+        pts = qr_points.reshape(-1, 2).astype(np.int32)
+        cv2.polylines(frame, [pts], True, green, 3)
+        cv2.putText(frame, "QR LOCKED", (int(pts[:, 0].min()), int(pts[:, 1].min()) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, green, 2)
+
+    # Header, status and progress bar.
+    cv2.putText(frame, "FORTRESS QR VERIFICATION", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cyan, 2)
+    cv2.putText(frame, status, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, white, 2)
+    bar_x1, bar_x2, bar_y = 20, w - 20, h - 40
+    cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 14), (72, 56, 18), 1)
+    fill = bar_x1 + int((bar_x2 - bar_x1) * min(progress, 1.0))
+    cv2.rectangle(frame, (bar_x1 + 2, bar_y + 2), (max(bar_x1 + 2, fill - 2), bar_y + 12), cyan, -1)
+    cv2.putText(frame, f"{int(min(progress, 1.0) * 100)}%", (bar_x2 - 50, bar_y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, white, 1)
+    cv2.putText(frame, "Press Q to cancel", (20, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (190, 180, 150), 1)
+
+
+def run_qr_verification():
+    """
+    Show the QR scanning animation on the laptop webcam.
+    Returns "VERIFIED", "CANCELLED" (Q pressed) or "ERROR: <reason>".
+    """
+    camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not camera.isOpened():
+        camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        return "ERROR: could not open webcam"
+
+    detector = cv2.QRCodeDetector()
+    stages = [
+        (0.00, "SEARCHING FOR FORTRESS QR..."),
+        (0.25, "QR PATTERN ACQUIRED"),
+        (0.50, "DECODING SECURE PAYLOAD..."),
+        (0.75, "MATCHING ENROLLED CARD DATABASE..."),
+    ]
+    progress = 0.0
+    qr_points = None
+    last = time.time()
+
+    try:
+        while True:
+            ret, frame = camera.read()
+            if not ret:
+                return "ERROR: camera frame unavailable"
+
+            now = time.time()
+            dt, last = now - last, now
+
+            qr_points = None
+            try:
+                found, points = detector.detect(frame)
+                if found and points is not None:
+                    qr_points = points
+            except cv2.error:
+                pass
+
+            # ~3 s with a QR in view, ~8 s without one; it always finishes.
+            progress += dt * (0.33 if qr_points is not None else 0.12)
+            status = [text for start, text in stages if progress >= start][-1]
+
+            if progress >= 1.0:
+                end = time.time() + 1.8
+                while time.time() < end:
+                    ret, frame = camera.read()
+                    if not ret:
+                        break
+                    draw_qr_scan_overlay(frame, 1.0, "QR VERIFIED", qr_points, time.time())
+                    h, w = frame.shape[:2]
+                    cv2.putText(frame, "ACCESS GRANTED", (w // 2 - 150, h // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (160, 230, 22), 3)
+                    cv2.putText(frame, f"{DEMO_CARD_ID} // {DEMO_CARD_OWNER}", (w // 2 - 150, h // 2 + 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 247, 234), 2)
+                    cv2.imshow(QR_WINDOW_NAME, frame)
+                    cv2.waitKey(30)
+                return "VERIFIED"
+
+            draw_qr_scan_overlay(frame, progress, status, qr_points, now)
+            cv2.imshow(QR_WINDOW_NAME, frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                return "CANCELLED"
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+
 class FortressHUD:
 
     def __init__(self, root):
@@ -795,6 +923,7 @@ class FortressHUD:
 
         self.face_scan_running = False
         self.palm_scan_running = False
+        self.qr_scan_running = False
 
         self.root.bind(
             "<F2>",
@@ -1473,6 +1602,47 @@ class FortressHUD:
             fill=color,
             outline=color
         )
+
+        # Clickable VERIFY QR button once the phone PIN has passed.
+        if name == "CARD VERIFICATION" and current in ("PENDING", "FAILED"):
+
+            button = self.canvas.create_rectangle(
+                x2 - 150,
+                y1 + 14,
+                x2 - 45,
+                y1 + 38,
+                fill="#0A2733",
+                outline=CYAN,
+                width=1,
+                tags=("verify_qr",)
+            )
+
+            label = self.canvas.create_text(
+                x2 - 97,
+                y1 + 26,
+                text="VERIFY QR",
+                fill=CYAN,
+                font=("Segoe UI", 8, "bold"),
+                tags=("verify_qr",)
+            )
+
+            self.canvas.tag_bind(
+                "verify_qr",
+                "<Button-1>",
+                self.on_verify_qr_click
+            )
+
+            self.canvas.tag_bind(
+                "verify_qr",
+                "<Enter>",
+                lambda event: self.canvas.configure(cursor="hand2")
+            )
+
+            self.canvas.tag_bind(
+                "verify_qr",
+                "<Leave>",
+                lambda event: self.canvas.configure(cursor="")
+            )
 
     # ========================================================
     # NEXUS
@@ -3045,6 +3215,10 @@ $synth.Dispose()
                 if palm_status == "SCANNING" and not self.palm_scan_running:
                     self.start_palm_verification()
 
+                # Phone tapped VERIFY QR: run the QR scan on this laptop.
+                if card_status == "SCANNING" and not self.qr_scan_running:
+                    self.start_qr_verification()
+
                 # Mirror real controller results into the laptop HUD.
                 if face_status in ("VERIFIED", "PASSED") and state.get("FACE VERIFICATION") != "PASSED":
                     self.face_pass()
@@ -3213,6 +3387,82 @@ $synth.Dispose()
             state["PHONE PIN"] = "LOCKED"
             state["CARD VERIFICATION"] = "LOCKED"
             events.append((datetime.now().strftime("%H:%M:%S"), "PALM VERIFICATION", "FAILED"))
+            self.request_rebuild()
+
+    # ========================================================
+    # QR VERIFICATION — LAPTOP WEBCAM (demo-only)
+    # ========================================================
+
+    def on_verify_qr_click(
+        self,
+        event=None
+    ):
+
+        # Let the phone/controller know the scan started, then run it here.
+        try:
+            requests.post(CONTROLLER_URL + "/card_request", timeout=1.5)
+        except Exception:
+            pass
+
+        self.start_qr_verification()
+
+    def start_qr_verification(self):
+
+        if self.qr_scan_running or self.face_scan_running or self.palm_scan_running:
+            return
+
+        self.qr_scan_running = True
+
+        state["CARD VERIFICATION"] = "SCANNING"
+        events.append((datetime.now().strftime("%H:%M:%S"), "QR VERIFICATION", "SCANNING"))
+        self.request_rebuild()
+
+        threading.Thread(
+            target=self.qr_verification_worker,
+            daemon=True
+        ).start()
+
+    def qr_verification_worker(self):
+
+        try:
+            result = run_qr_verification()
+        except Exception as error:
+            result = f"ERROR: {type(error).__name__}: {error}"
+
+        print("QR VERIFICATION RESULT:", result)
+
+        if result == "VERIFIED":
+            notify_controller("/card_verified")
+        else:
+            message = (
+                "QR VERIFICATION CANCELLED"
+                if result == "CANCELLED"
+                else f"QR SCAN {result.upper()}"
+            )
+            try:
+                requests.post(
+                    CONTROLLER_URL + "/card_denied",
+                    json={"message": message},
+                    timeout=1.5
+                )
+            except Exception:
+                pass
+
+        self.root.after(0, self.qr_verification_done, result == "VERIFIED")
+
+    def qr_verification_done(
+        self,
+        verified
+    ):
+
+        self.qr_scan_running = False
+
+        if verified:
+            if state.get("CARD VERIFICATION") != "PASSED":
+                self.code_pass()
+        elif state.get("CARD VERIFICATION") != "FAILED":
+            state["CARD VERIFICATION"] = "FAILED"
+            events.append((datetime.now().strftime("%H:%M:%S"), "QR VERIFICATION", "FAILED"))
             self.request_rebuild()
 
     # ========================================================

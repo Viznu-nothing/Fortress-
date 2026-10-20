@@ -2,7 +2,6 @@ from flask import Flask, jsonify, render_template_string, request
 import cv2
 import numpy as np
 import json
-import math
 import re
 import os
 import time
@@ -1153,8 +1152,8 @@ body {
 
     <!-- CARD VERIFICATION PANEL -->
     <div class="security-panel" id="securityPanel">
-        <div class="security-title">SCAN FORTRESS CARD QR WITH LAPTOP WEBCAM</div>
-        <button class="verify-security" type="button" id="verifyCardButton" onclick="startCardScan()">SCAN CARD ON LAPTOP</button>
+        <div class="security-title">SHOW FORTRESS QR TO LAPTOP WEBCAM</div>
+        <button class="verify-security" type="button" id="verifyCardButton" onclick="startCardScan()">VERIFY QR</button>
         <div class="error" id="securityError"></div>
     </div>
 
@@ -1448,13 +1447,13 @@ async function startCardScan() {
         const response = await fetch("/card_request", {method: "POST"});
         const data = await response.json();
         updateUI(data);
-        if (!response.ok) error.textContent = data.message || "COULD NOT START CARD SCAN";
-        else error.textContent = "Laptop webcam opened. Show the card QR to the webcam; press Q to cancel.";
+        if (!response.ok) error.textContent = data.message || "COULD NOT START QR SCAN";
+        else error.textContent = "Laptop webcam opening. Show the QR to the laptop webcam; press Q there to cancel.";
     } catch (e) {
         error.textContent = "CONTROLLER ERROR — CHECK LAPTOP SERVER";
     } finally {
         button.disabled = false;
-        button.textContent = "SCAN CARD ON LAPTOP";
+        button.textContent = "VERIFY QR";
     }
 }
 
@@ -1801,158 +1800,42 @@ def read_printed_fortress_id(image):
 
 
 # ============================================================
-# CARD VERIFICATION — laptop webcam, demo-only QR scan animation
-# The QR is NOT decoded or checked against any database. The scan
-# always completes; a QR in view just makes the progress run faster.
+# QR CARD VERIFICATION — runs in the laptop HUD
+# The HUD (FORTRESS_FACE_PHONE_INTEGRATED.py) polls /state, runs the
+# demo QR scan on the laptop webcam when it sees security_code=SCANNING,
+# and reports back via /card_verified or /card_denied.
 # ============================================================
-CARD_SCAN_LOCK = threading.Lock()
-CARD_SCAN_THREAD = None
 DEMO_CARD_OWNER = "VISHNU VARDHAN"
 DEMO_CARD_ID = "FRT-V001"
 
 
-def draw_card_scan_overlay(frame, progress, status, qr_points, now):
-    h, w = frame.shape[:2]
-    cyan, green, white = (255, 217, 32), (160, 230, 22), (255, 247, 234)
-
-    # Dim everything outside the target box.
-    box = int(min(w, h) * 0.62)
-    x1, y1 = (w - box) // 2, (h - box) // 2
-    x2, y2 = x1 + box, y1 + box
-    shade = frame.copy()
-    shade[:] = (shade * 0.35).astype(np.uint8)
-    shade[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
-    frame[:] = shade
-
-    # Corner brackets.
-    arm = box // 7
-    for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
-        cv2.line(frame, (cx, cy), (cx + dx * arm, cy), cyan, 3)
-        cv2.line(frame, (cx, cy), (cx, cy + dy * arm), cyan, 3)
-
-    # Sweeping scan line with a fading trail.
-    sweep = (math.sin(now * 3.0) + 1) / 2
-    line_y = int(y1 + sweep * box)
-    for i in range(12):
-        alpha = 1.0 - i / 12
-        ty = line_y - i * 3 if math.cos(now * 3.0) > 0 else line_y + i * 3
-        if y1 <= ty <= y2:
-            color = tuple(int(c * alpha) for c in cyan)
-            cv2.line(frame, (x1 + 4, ty), (x2 - 4, ty), color, 1)
-    cv2.line(frame, (x1 + 4, line_y), (x2 - 4, line_y), white, 2)
-
-    if qr_points is not None:
-        pts = qr_points.reshape(-1, 2).astype(np.int32)
-        cv2.polylines(frame, [pts], True, green, 3)
-        cv2.putText(frame, "QR LOCKED", (int(pts[:, 0].min()), int(pts[:, 1].min()) - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, green, 2)
-
-    # Header, status and progress bar.
-    cv2.putText(frame, "FORTRESS CARD VERIFICATION", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cyan, 2)
-    cv2.putText(frame, status, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, white, 2)
-    bar_x1, bar_x2, bar_y = 20, w - 20, h - 40
-    cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 14), (72, 56, 18), 1)
-    fill = bar_x1 + int((bar_x2 - bar_x1) * min(progress, 1.0))
-    cv2.rectangle(frame, (bar_x1 + 2, bar_y + 2), (max(bar_x1 + 2, fill - 2), bar_y + 12), cyan, -1)
-    cv2.putText(frame, f"{int(min(progress, 1.0) * 100)}%", (bar_x2 - 50, bar_y - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, white, 1)
-    cv2.putText(frame, "Press Q to cancel", (20, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (190, 180, 150), 1)
-
-
-def run_card_scan():
-    """Show a QR scanning animation on the laptop webcam, then approve the demo card."""
-    camera = None
-    try:
-        # Same camera opening as face_verify_test.py: DirectShow first on Windows.
-        camera = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(0)
-        if not camera.isOpened():
-            camera = cv2.VideoCapture(0)
-        if not camera.isOpened():
-            state.update(security_code="FAILED", security_code_verified=False,
-                         message="CARD SCAN ERROR: LAPTOP WEBCAM COULD NOT OPEN")
-            return
-        state.update(security_code="SCANNING", security_code_verified=False,
-                     message="CARD SCANNING ON LAPTOP WEBCAM")
-
-        detector = cv2.QRCodeDetector()
-        stages = [
-            (0.00, "SEARCHING FOR FORTRESS CARD..."),
-            (0.25, "QR PATTERN ACQUIRED"),
-            (0.50, "DECODING SECURE PAYLOAD..."),
-            (0.75, "MATCHING ENROLLED CARD DATABASE..."),
-        ]
-        progress = 0.0
-        last = time.time()
-        while True:
-            ret, frame = camera.read()
-            if not ret:
-                state.update(security_code="FAILED", security_code_verified=False,
-                             message="CARD SCAN ERROR: CAMERA FRAME UNAVAILABLE")
-                return
-            now = time.time()
-            dt, last = now - last, now
-
-            qr_points = None
-            try:
-                found, points = detector.detect(frame)
-                if found and points is not None:
-                    qr_points = points
-            except cv2.error:
-                pass
-
-            # ~3 s with a QR in view, ~8 s without one; it always finishes.
-            progress += dt * (0.33 if qr_points is not None else 0.12)
-            status = [text for start, text in stages if progress >= start][-1]
-
-            if progress >= 1.0:
-                state.update(security_code="VERIFIED", security_code_verified=True,
-                             card_owner=DEMO_CARD_OWNER, card_id=DEMO_CARD_ID, vault="AUTHORIZED",
-                             message=f"CARD VERIFIED // {DEMO_CARD_OWNER}")
-                end = time.time() + 1.8
-                while time.time() < end:
-                    ret, frame = camera.read()
-                    if not ret:
-                        break
-                    draw_card_scan_overlay(frame, 1.0, "CARD VERIFIED", qr_points, time.time())
-                    h, w = frame.shape[:2]
-                    cv2.putText(frame, "ACCESS GRANTED", (w // 2 - 150, h // 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (160, 230, 22), 3)
-                    cv2.putText(frame, f"{DEMO_CARD_ID} // {DEMO_CARD_OWNER}", (w // 2 - 150, h // 2 + 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 247, 234), 2)
-                    cv2.imshow("FORTRESS - Card Verification", frame)
-                    cv2.waitKey(30)
-                return
-
-            draw_card_scan_overlay(frame, progress, status, qr_points, now)
-            cv2.imshow("FORTRESS - Card Verification", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                state.update(security_code="FAILED", security_code_verified=False, vault="LOCKED",
-                             message="CARD VERIFICATION CANCELLED")
-                return
-    except Exception as exc:
-        state.update(security_code="FAILED", security_code_verified=False,
-                     message=f"CARD SCAN ERROR: {type(exc).__name__}: {exc}")
-    finally:
-        if camera is not None:
-            camera.release()
-        cv2.destroyAllWindows()
-        CARD_SCAN_LOCK.release()
-
-
 @app.route("/card_request", methods=["POST"])
 def card_request():
-    global CARD_SCAN_THREAD
     if not state.get("password_verified"):
         state["message"] = "PHONE PIN VERIFICATION REQUIRED"
         return jsonify(state), 403
-    if not CARD_SCAN_LOCK.acquire(blocking=False):
-        state["message"] = "CARD SCAN ALREADY RUNNING ON LAPTOP"
-        return jsonify(state), 409
     state.update(security_code="SCANNING", security_code_verified=False,
-                 message="OPENING LAPTOP WEBCAM FOR CARD VERIFICATION")
-    CARD_SCAN_THREAD = threading.Thread(target=run_card_scan, daemon=True)
-    CARD_SCAN_THREAD.start()
+                 message="OPENING LAPTOP WEBCAM FOR QR VERIFICATION")
     return jsonify(state), 202
+
+
+@app.route("/card_verified", methods=["POST"])
+def card_verified():
+    if not state.get("password_verified"):
+        state["message"] = "PHONE PIN VERIFICATION REQUIRED"
+        return jsonify(state), 403
+    state.update(security_code="VERIFIED", security_code_verified=True,
+                 card_owner=DEMO_CARD_OWNER, card_id=DEMO_CARD_ID, vault="AUTHORIZED",
+                 message=f"QR VERIFIED // {DEMO_CARD_OWNER}")
+    return jsonify(state)
+
+
+@app.route("/card_denied", methods=["POST"])
+def card_denied():
+    data = request.get_json(silent=True) or {}
+    state.update(security_code="FAILED", security_code_verified=False, vault="LOCKED",
+                 message=str(data.get("message") or "QR VERIFICATION FAILED"))
+    return jsonify(state)
 
 
 # QR enrolment routes intentionally removed.
