@@ -212,6 +212,10 @@ LIVE_REQUIRED = 2
 IDENTITY_REQUIRED = 2
 SPOOF_REQUIRED = 3
 
+# A live face that does not match the enrolled identity for this long
+# is denied and counted as a failed attempt.
+FACE_MISMATCH_SECONDS = 8
+
 # OpenCV colors (BGR)
 CV_CYAN = (30, 220, 255)
 CV_GREEN = (40, 235, 150)
@@ -221,9 +225,9 @@ CV_GRAY = (100, 130, 145)
 CV_BLACK = (5, 8, 12)
 
 
-def notify_controller(path):
+def notify_controller(path, payload=None):
     try:
-        requests.post(CONTROLLER_URL + path, timeout=1.5)
+        requests.post(CONTROLLER_URL + path, json=payload, timeout=1.5)
     except Exception:
         pass
 
@@ -312,7 +316,8 @@ def draw_face_box(image, face, color):
 def run_face_verification():
     """
     Run live face verification on the laptop webcam.
-    Returns "VERIFIED", "CANCELLED" (ESC pressed) or "ERROR: <reason>".
+    Returns "VERIFIED", "MISMATCH" (wrong person), "CANCELLED" (ESC
+    pressed) or "ERROR: <reason>".
     A detected spoof is reported to the controller as denied while the
     scan keeps going, matching face_verify_test.py.
     """
@@ -375,6 +380,7 @@ def run_face_verification():
     live_count = spoof_count = identity_count = 0
     identity_score = liveness_score = 0.0
     denied_time = verified_time = None
+    identity_start = None
     result = "CANCELLED"
 
     try:
@@ -382,6 +388,10 @@ def run_face_verification():
             ret, frame = cap.read()
             if not ret:
                 continue
+
+            # Wrong identity: close once the denial has been shown.
+            if result == "MISMATCH" and time.time() - denied_time >= 1.5:
+                break
 
             # Detection on the original frame, mirrored display
             detector.setInputSize((frame.shape[1], frame.shape[0]))
@@ -455,11 +465,12 @@ def run_face_verification():
 
                 if live_count >= LIVE_REQUIRED:
                     identity_count = 0
+                    identity_start = time.time()
                     scan_state = IDENTITY
 
                 elif spoof_count >= SPOOF_REQUIRED:
                     scan_state = DENIED
-                    notify_controller("/face_denied")
+                    notify_controller("/face_denied", {"reason": "spoof detected"})
                     denied_time = time.time()
 
             # SFace identity
@@ -492,6 +503,12 @@ def run_face_verification():
                     notify_controller("/face_verified")
                     verified_time = time.time()
 
+                elif time.time() - identity_start >= FACE_MISMATCH_SECONDS:
+                    # Live person, wrong identity.
+                    scan_state = DENIED
+                    result = "MISMATCH"
+                    denied_time = time.time()
+
             if scan_state == VERIFIED:
                 cv_text(display, "IDENTITY VERIFIED", 25, height - 72, CV_GREEN, 0.88, 2)
                 cv_text(display, "LIVE SUBJECT AUTHENTICATED", 25, height - 40, CV_GREEN, 0.50, 1)
@@ -501,7 +518,10 @@ def run_face_verification():
                 cv_text(display, "LIVE IDENTITY NOT VERIFIED", 25, height - 40, CV_RED, 0.50, 1)
 
                 # Keep denial visible briefly, then scan again
+                # (or close the window after a wrong identity).
                 if denied_time is not None and time.time() - denied_time >= 1.5:
+                    if result == "MISMATCH":
+                        break
                     scan_state = SEARCHING
                     denied_time = None
 
@@ -548,6 +568,10 @@ PALM_WINDOW_NAME = "FORTRESS - Palm Verification"
 MATCH_THRESHOLD = 0.985
 REQUIRED_MATCHES = 8
 
+# A palm that is in view but does not match for this long (in total)
+# is denied and counted as a failed attempt.
+PALM_MISMATCH_SECONDS = 8
+
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -571,7 +595,8 @@ def find_palm_files():
 def run_palm_verification():
     """
     Run live palm verification on the laptop webcam.
-    Returns "VERIFIED", "CANCELLED" (Q pressed) or "ERROR: <reason>".
+    Returns "VERIFIED", "MISMATCH" (wrong palm), "CANCELLED" (Q pressed)
+    or "ERROR: <reason>".
     """
     import mediapipe as mp
 
@@ -615,6 +640,8 @@ def run_palm_verification():
     consecutive_matches = 0
     verified = False
     result_text = "CANCELLED"
+    mismatch_seconds = 0.0
+    last_frame_time = time.time()
 
     try:
         while True:
@@ -623,6 +650,9 @@ def run_palm_verification():
             if not ret:
                 result_text = "ERROR: camera frame unavailable"
                 break
+
+            now = time.time()
+            frame_dt, last_frame_time = now - last_frame_time, now
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -670,6 +700,7 @@ def run_palm_verification():
                         else:
                             consecutive_matches = 0
                             status = "PALM DETECTED — NO MATCH"
+                            mismatch_seconds += frame_dt
 
                         if consecutive_matches >= REQUIRED_MATCHES:
                             verified = True
@@ -707,6 +738,14 @@ def run_palm_verification():
                 print("PALM VERIFIED — live palm matches enrolled biometric profile.")
                 result_text = "VERIFIED"
                 cv2.waitKey(1500)
+                break
+
+            if mismatch_seconds >= PALM_MISMATCH_SECONDS:
+                print("PALM NOT RECOGNISED — access denied.")
+                cv2.putText(frame, "PALM NOT RECOGNISED", (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 70, 255), 2)
+                cv2.imshow(PALM_WINDOW_NAME, frame)
+                cv2.waitKey(1500)
+                result_text = "MISMATCH"
                 break
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -3351,8 +3390,13 @@ $synth.Dispose()
         if result == "VERIFIED":
             self.root.after(0, self.face_verification_done, True)
         else:
-            # Cancelled (ESC) or error: tell the phone so it is not stuck on SCANNING.
-            notify_controller("/face_denied")
+            # Wrong face, cancelled (ESC) or error: tell the phone so it is
+            # not stuck on SCANNING. The controller counts it as a failure.
+            reason = {
+                "MISMATCH": "face did not match enrolled identity",
+                "CANCELLED": "face scan cancelled",
+            }.get(result, result)
+            notify_controller("/face_denied", {"reason": reason})
             self.root.after(0, self.face_verification_done, False)
 
     def face_verification_done(
@@ -3405,11 +3449,10 @@ $synth.Dispose()
         if result == "VERIFIED":
             notify_controller("/palm_verified")
         else:
-            message = (
-                "PALM VERIFICATION CANCELLED"
-                if result == "CANCELLED"
-                else f"PALM SCAN {result.upper()}"
-            )
+            message = {
+                "CANCELLED": "PALM VERIFICATION CANCELLED",
+                "MISMATCH": "ACCESS DENIED // PALM NOT RECOGNISED",
+            }.get(result, f"PALM SCAN {result.upper()}")
             try:
                 requests.post(
                     CONTROLLER_URL + "/palm_denied",

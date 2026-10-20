@@ -6,6 +6,7 @@ import re
 import os
 import time
 import pickle
+import shutil
 import threading
 import subprocess
 import sys
@@ -42,6 +43,102 @@ state = {
 
     "message": "FACE VERIFICATION REQUIRED"
 }
+
+
+# ============================================================
+# INTRUSION DATA BACKUP (silent — nothing is shown on the phone)
+#
+# A backup of PROTECTED_DATA_DIR is zipped into BACKUP_DIR, with an
+# incident report, when:
+#   - the same layer (face, palm or phone PIN) fails MAX_LAYER_FAILURES
+#     times in a row,
+#   - MAX_TOTAL_FAILURES failures pile up across all layers, or
+#   - someone types the symbols on the phone at the final sequence
+#     stage (the real owner never types them; they say the phrase).
+# ============================================================
+
+PROTECTED_DATA_DIR = Path(__file__).resolve().parent / "protected_data"
+BACKUP_DIR = Path(__file__).resolve().parent / "fortress_backups"
+
+MAX_LAYER_FAILURES = 3
+MAX_TOTAL_FAILURES = 5
+BACKUP_COOLDOWN_SECONDS = 30
+
+failures = {"face": 0, "palm": 0, "password": 0}   # in a row, per layer
+failure_total = {"count": 0}   # all layers; cleared only by a backup or a full unlock
+last_backup_time = {}
+BACKUP_LOCK = threading.Lock()
+
+
+def run_backup(trigger, detail, remote_addr, snapshot):
+    with BACKUP_LOCK:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            PROTECTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+            archive = shutil.make_archive(
+                str(BACKUP_DIR / f"backup_{stamp}"), "zip", root_dir=str(PROTECTED_DATA_DIR)
+            )
+
+            incident = {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "trigger": trigger,
+                "detail": detail,
+                "remote_addr": remote_addr,
+                "failures": snapshot["failures"],
+                "state": snapshot["state"],
+                "backup_file": Path(archive).name,
+            }
+            (BACKUP_DIR / f"incident_{stamp}.json").write_text(
+                json.dumps(incident, indent=2), encoding="utf-8"
+            )
+            print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — data backed up to {archive}")
+        except Exception as exc:
+            print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — BACKUP FAILED: {exc}")
+
+
+def trigger_backup(trigger, detail=""):
+    """Start a backup in the background. Call from inside a request."""
+    now = time.time()
+    if now - last_backup_time.get(trigger, 0) < BACKUP_COOLDOWN_SECONDS:
+        return
+    last_backup_time[trigger] = now
+    snapshot = {
+        "failures": dict(failures, total=failure_total["count"]),
+        "state": {k: v for k, v in state.items() if k != "message"},
+    }
+    threading.Thread(
+        target=run_backup,
+        args=(trigger, detail, request.remote_addr, snapshot),
+        daemon=True,
+    ).start()
+
+
+def record_failure(layer, detail=""):
+    failures[layer] += 1
+    failure_total["count"] += 1
+    total = failure_total["count"]
+    print(f"[FORTRESS] {layer.upper()} FAILED ({failures[layer]} in a row, {total} total): {detail}")
+
+    if failures[layer] >= MAX_LAYER_FAILURES:
+        trigger_backup(f"REPEATED {layer.upper()} FAILURES", detail)
+    elif total >= MAX_TOTAL_FAILURES:
+        trigger_backup("REPEATED UNAUTHORIZED ACCESS ATTEMPTS", detail)
+    else:
+        return
+
+    clear_failures()
+
+
+def clear_failures():
+    for key in failures:
+        failures[key] = 0
+    failure_total["count"] = 0
+
+
+def record_success(layer):
+    failures[layer] = 0
 
 
 # ============================================================
@@ -1667,6 +1764,7 @@ def face_request():
 
 @app.route("/face_verified", methods=["POST"])
 def face_verified():
+    record_success("face")
     state.update({
         "face": "VERIFIED", "face_verified": True,
         "palm": "ACTIVE", "palm_verified": False,
@@ -1680,6 +1778,8 @@ def face_verified():
 
 @app.route("/face_denied", methods=["POST"])
 def face_denied():
+    data = request.get_json(silent=True) or {}
+    record_failure("face", str(data.get("reason") or "face denied"))
     state.update({
         "face": "FAILED", "face_verified": False,
         "palm": "LOCKED", "palm_verified": False,
@@ -1715,6 +1815,7 @@ def palm_verified():
     if not state.get("face_verified"):
         state["message"] = "FACE VERIFICATION REQUIRED"
         return jsonify(state), 403
+    record_success("palm")
     state.update(palm="VERIFIED", palm_verified=True, password="ACTIVE", password_verified=False,
                  security_code="LOCKED", security_code_verified=False, vault="LOCKED",
                  message="PALM VERIFIED // PHONE PIN REQUIRED")
@@ -1724,6 +1825,7 @@ def palm_verified():
 @app.route("/palm_denied", methods=["POST"])
 def palm_denied():
     data = request.get_json(silent=True) or {}
+    record_failure("palm", str(data.get("message") or "palm denied"))
     state.update(palm="FAILED", palm_verified=False, password="LOCKED", password_verified=False,
                  security_code="LOCKED", security_code_verified=False, vault="LOCKED",
                  message=str(data.get("message") or "PALM VERIFICATION FAILED"))
@@ -1841,6 +1943,7 @@ def verify_password():
     data = request.get_json(silent=True) or {}
     entered = str(data.get("password", ""))
     if entered == PASSWORD:
+        record_success("password")
         state["password"] = "VERIFIED"
         state["password_verified"] = True
         state["security_code"] = "ACTIVE"
@@ -1854,6 +1957,7 @@ def verify_password():
     state["security_code_verified"] = False
     state["vault"] = "LOCKED"
     state["message"] = "INVALID PHONE PIN"
+    record_failure("password", "wrong phone PIN")
     return jsonify(state), 401
 
 
@@ -1994,6 +2098,10 @@ def submit_sequence():
         state["message"] = "SEQUENCE NOT AVAILABLE"
         return jsonify(state), 403
     # Intentionally never accepted, even when every symbol is correct.
+    # The real owner says the phrase instead, so typing here means an intruder.
+    data = request.get_json(silent=True) or {}
+    trigger_backup("FINAL SEQUENCE TYPED ON PHONE",
+                   f"{len(str(data.get('sequence', '')))} characters entered")
     state["vault"] = "LOCKED"
     state["message"] = "ACCESS DENIED"
     return jsonify(state), 401
@@ -2005,6 +2113,7 @@ def sequence_unlock():
         return jsonify(state), 403
     if not state.get("security_code_verified") or state.get("sequence") != "ACTIVE":
         return jsonify(state), 403
+    clear_failures()
     state.update(sequence="VERIFIED", vault="AUTHORIZED",
                  message=f"ACCESS AUTHORIZED // {DEMO_CARD_OWNER}")
     return jsonify(state)
