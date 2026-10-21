@@ -205,34 +205,37 @@ CURRENT_FOLDER = os.path.dirname(
     os.path.abspath(__file__)
 )
 
-KNOWLEDGE_FILE = os.path.join(
-    CURRENT_FOLDER,
-    "NEXUS_KNOWLEDGE.txt"
-)
+# Every NEXUS_KNOWLEDGE*.txt file is loaded, in name order, e.g.
+#   NEXUS_KNOWLEDGE.txt           (modules 1-15)
+#   NEXUS_KNOWLEDGE_ADVANCED.txt  (modules 16-30)
+# from this folder, or from a NEXUS subfolder if none are here.
 
-if not os.path.exists(KNOWLEDGE_FILE):
+import glob
 
-    KNOWLEDGE_FILE = os.path.join(
-        CURRENT_FOLDER,
-        "NEXUS",
-        "NEXUS_KNOWLEDGE.txt"
-    )
 
-try:
+def load_nexus_knowledge():
+    for folder in (CURRENT_FOLDER, os.path.join(CURRENT_FOLDER, "NEXUS")):
+        paths = sorted(glob.glob(os.path.join(folder, "NEXUS_KNOWLEDGE*.txt")))
+        if not paths:
+            continue
 
-    with open(
-        KNOWLEDGE_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
+        parts = []
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    parts.append(f.read().strip())
+                print("NEXUS KNOWLEDGE LOADED:", os.path.basename(path))
+            except Exception as error:
+                print("NEXUS KNOWLEDGE ERROR:", os.path.basename(path), error)
 
-        NEXUS_KNOWLEDGE = f.read()
+        if parts:
+            return "\n\n".join(parts)
 
-except Exception:
+    print("NEXUS KNOWLEDGE: no NEXUS_KNOWLEDGE*.txt file found")
+    return "FORTRESS Knowledge Core is currently unavailable."
 
-    NEXUS_KNOWLEDGE = (
-        "FORTRESS Knowledge Core is currently unavailable."
-    )
+
+NEXUS_KNOWLEDGE = load_nexus_knowledge()
 
 
 # ============================================================
