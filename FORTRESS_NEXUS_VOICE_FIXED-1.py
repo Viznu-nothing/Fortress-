@@ -151,12 +151,31 @@ _gemini_model = os.environ.get("GEMINI_MODEL") or None
 
 
 def _clean_key(raw):
-    key = raw.strip()
+    # Google AI Studio keys look like AIza + 35 url-safe chars. If the file
+    # has a label, a note, or several lines, pull the real key out of it.
+    match = re.search(r"AIza[0-9A-Za-z_\-]{35}", raw)
+    if match:
+        return match.group(0)
+
+    # Otherwise take the first non-empty line and strip quotes / NAME= prefix.
+    key = ""
+    for line in raw.splitlines():
+        if line.strip():
+            key = line.strip()
+            break
     if len(key) >= 2 and key[0] in "\"'" and key[-1] in "\"'":
         key = key[1:-1].strip()
     if key.upper().startswith(("GEMINI_API_KEY=", "GOOGLE_API_KEY=")):
         key = key.split("=", 1)[1].strip().strip("\"'")
     return key
+
+
+def _mask_key(key):
+    if not key:
+        return "(empty)"
+    if len(key) <= 10:
+        return f"{len(key)} chars"
+    return f"{key[:6]}...{key[-4:]} ({len(key)} chars)"
 
 
 def get_gemini_key(verbose=False):
@@ -183,7 +202,10 @@ def get_gemini_key(verbose=False):
                     continue
                 if key:
                     if verbose:
-                        print("NEXUS AI: Gemini key loaded from", path)
+                        print("NEXUS AI: Gemini key loaded from", path, "->", _mask_key(key))
+                        if not key.startswith("AIza"):
+                            print("NEXUS AI: WARNING - a Google AI Studio key normally"
+                                  " starts with 'AIza'. This key may be wrong.")
                     return key
                 elif verbose:
                     print("NEXUS AI:", path, "is empty")
