@@ -117,13 +117,82 @@ def make_gabor_bank():
 GABOR_BANK = make_gabor_bank()
 
 
-PALM_MIN_AREA = 0.04      # largest skin blob must be >= this share of the frame
+PALM_MIN_AREA = 0.04      # largest skin blob must be >= this share of the frame (fallback)
+
+# The hand is located with MediaPipe so only the hand is scanned, never the
+# face or a warm-coloured wall. hand_landmarker.task is looked up here.
+HAND_MODEL_DIRS = [
+    SCRIPT_DIR,
+    DATA_DIR,
+    Path.home() / "Downloads" / "NEXUS",
+    Path.home() / "Downloads",
+    Path.home() / "Desktop" / "NEXUS",
+    Path.home() / "Documents" / "NEXUS",
+]
+
+_hand_landmarker = None
+_hand_landmarker_tried = False
 
 
-def locate_palm(frame):
-    """Square region around the largest hand/palm anywhere in the frame,
-    or None when no hand-sized skin region is found. No fixed box: the
-    palm can be held wherever is comfortable."""
+def get_hand_landmarker():
+    """Lazy MediaPipe hand detector, or None if unavailable."""
+    global _hand_landmarker, _hand_landmarker_tried
+    if _hand_landmarker_tried:
+        return _hand_landmarker
+    _hand_landmarker_tried = True
+    try:
+        import mediapipe as mp
+        model = next((d / "hand_landmarker.task" for d in HAND_MODEL_DIRS
+                      if (d / "hand_landmarker.task").is_file()), None)
+        if model is None:
+            print("Palm: hand_landmarker.task not found; using colour fallback.")
+            return None
+        options = mp.tasks.vision.HandLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=str(model)),
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            num_hands=1,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+        )
+        _hand_landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
+        print("Palm: hand detector ready (", model.name, ")")
+    except Exception as exc:
+        print("Palm: hand detector unavailable (", exc, "); using colour fallback.")
+        _hand_landmarker = None
+    return _hand_landmarker
+
+
+def locate_hand_mediapipe(frame):
+    """Square region around the detected hand, or None. Only the hand."""
+    landmarker = get_hand_landmarker()
+    if landmarker is None:
+        return None
+    try:
+        import mediapipe as mp
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    except Exception:
+        return None
+    if not result.hand_landmarks:
+        return None
+
+    h, w = frame.shape[:2]
+    xs = [p.x * w for p in result.hand_landmarks[0]]
+    ys = [p.y * h for p in result.hand_landmarks[0]]
+    cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+    side = max(max(xs) - min(xs), max(ys) - min(ys)) * 1.25
+    x1 = int(max(0, cx - side / 2.0))
+    y1 = int(max(0, cy - side / 2.0))
+    x2 = int(min(w, cx + side / 2.0))
+    y2 = int(min(h, cy + side / 2.0))
+    if x2 - x1 < 60 or y2 - y1 < 60:
+        return None
+    return x1, y1, x2, y2
+
+
+def locate_palm_skin(frame):
+    """Fallback: largest skin blob. Used only when the hand detector is
+    unavailable; weak when the background or face is skin-coloured."""
     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
     skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 182, 135))
     skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
@@ -148,6 +217,15 @@ def locate_palm(frame):
     if x2 - x1 < 60 or y2 - y1 < 60:
         return None
     return x1, y1, x2, y2
+
+
+def locate_palm(frame):
+    """(rect, confirmed_hand). The hand detector finds only the hand; the
+    colour fallback is used only if the detector is unavailable."""
+    rect = locate_hand_mediapipe(frame)
+    if rect is not None:
+        return rect, True
+    return locate_palm_skin(frame), False
 
 
 def palm_mask(bgr):
@@ -177,7 +255,7 @@ def palm_mask(bgr):
 def extract_palm(frame):
     """(palm image, mask, problem or None, readings) for the palm found
     anywhere in the frame. readings['rect'] is where it was located."""
-    rect = locate_palm(frame)
+    rect, confirmed = locate_palm(frame)
     if rect is None:
         return (None, None, "SHOW YOUR PALM TO THE CAMERA",
                 {"fill": 0.0, "brightness": 0.0, "sharpness": 0.0, "skin": False, "rect": None})
@@ -187,6 +265,12 @@ def extract_palm(frame):
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
     mask, skin_like = palm_mask(crop)
+    # The hand detector already confirmed this is a hand, so don't second-guess
+    # it on skin colour (lighting/white balance can fool the colour test).
+    if confirmed:
+        skin_like = True
+        if mask is None or int(np.count_nonzero(mask)) < 0.15 * ROI_SIZE * ROI_SIZE:
+            mask = np.full((ROI_SIZE, ROI_SIZE), 255, np.uint8)
     on_palm = mask > 0
     fill = float(np.count_nonzero(on_palm)) / mask.size
     if fill > 0.02:
@@ -199,7 +283,7 @@ def extract_palm(frame):
 
     if not skin_like:
         problem = "SHOW YOUR PALM TO THE CAMERA"
-    elif fill < MIN_FILL:
+    elif not confirmed and fill < MIN_FILL:
         problem = "MOVE PALM CLOSER"
     elif brightness < MIN_BRIGHTNESS:
         problem = "TOO DARK - ADD LIGHT"
