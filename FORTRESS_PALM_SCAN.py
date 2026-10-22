@@ -526,41 +526,44 @@ def enroll():
 # Verify
 # ------------------------------------------------------------------
 
-def verify():
+def scan_palm(mismatch_seconds=None):
+    """Scan the palm on the webcam against the enrollment.
+
+    Returns "VERIFIED", "MISMATCH" (a palm was shown but did not match for
+    mismatch_seconds), "CANCELLED" (ESC or Q) or "ERROR: <reason>".
+    Used by the FORTRESS HUD; verify() is the standalone version.
+    """
     if not ENROLLMENT_PATH.is_file():
-        print("No enrollment found at", ENROLLMENT_PATH)
-        print("Choose 1 to enroll first.")
-        return None
+        return f"ERROR: no palm enrollment at {ENROLLMENT_PATH} - run FORTRESS_PALM_SCAN.py, choose 1"
 
     grays, masks = load_enrollment()
     enrolled = prepare_enrolled(grays, masks)
     cal = calibrate(enrolled)
     required = max(1, int(np.ceil(len(enrolled) * SAMPLE_AGREEMENT)))
-    print(f"Thresholds: palm-line distance <= "
+    print(f"Palm thresholds: palm-line distance <= "
           f"{cal['distance_limit']:.3f} (your scans: {cal['genuine_distance']:.3f}), "
           f"{required} of {len(enrolled)} scans, {REQUIRED_CONSECUTIVE} checks in a row")
 
     cap = open_camera()
     if not cap.isOpened():
-        print("Could not open webcam.")
-        return None
+        return "ERROR: could not open webcam"
 
     streak = 0
     last_eval = 0.0
+    no_match_time = 0.0
     scores = []
     readings = None
     status, color = "PLACE PALM IN THE BOX", CYAN
-    verified = False
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
-                print("Camera frame unavailable.")
-                return None
+                return "ERROR: camera frame unavailable"
             frame = cv2.flip(frame, 1)
             now = time.time()
 
             if now - last_eval >= EVAL_INTERVAL:
+                step = min(now - last_eval, 1.0) if last_eval else 0.0
                 last_eval = now
                 gray, mask, problem, readings = extract_palm(frame)
                 if problem:
@@ -573,12 +576,12 @@ def verify():
                                    if aligned and d <= cal["distance_limit"])
                     streak = streak + 1 if agreeing >= required else 0
                     if streak >= REQUIRED_CONSECUTIVE:
-                        verified = True
                         status, color = "PALM VERIFIED", GREEN
                     elif streak:
                         status, color = f"SCANNING {streak}/{REQUIRED_CONSECUTIVE}", CYAN
                     else:
                         status, color = "NO MATCH", RED
+                        no_match_time += step
 
             lines = [readings_line(readings)] if readings else []
             if scores:
@@ -587,18 +590,35 @@ def verify():
                 lines.append("Line distance: " + " ".join(f"{d:.2f}" if d < 1 else "--" for _, d, _ in scores)
                              + f"  (need <= {cal['distance_limit']:.2f})")
             draw(frame, "FORTRESS PALM SCAN", status, color, lines, streak / REQUIRED_CONSECUTIVE)
-            cv2.imshow(WINDOW, frame)
 
-            if verified:
+            if streak >= REQUIRED_CONSECUTIVE:
+                cv2.imshow(WINDOW, frame)
                 cv2.waitKey(1200)
-                print("PALM VERIFIED")
-                return True
-            if cv2.waitKey(1) & 0xFF == 27:
-                print("Scan cancelled.")
-                return False
+                return "VERIFIED"
+
+            if mismatch_seconds is not None and no_match_time >= mismatch_seconds:
+                draw(frame, "FORTRESS PALM SCAN", "PALM NOT RECOGNISED - ACCESS DENIED", RED, lines)
+                cv2.imshow(WINDOW, frame)
+                cv2.waitKey(1500)
+                return "MISMATCH"
+
+            cv2.imshow(WINDOW, frame)
+            if (cv2.waitKey(1) & 0xFF) in (27, ord("q"), ord("Q")):
+                return "CANCELLED"
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
+
+def verify():
+    result = scan_palm()
+    if result == "VERIFIED":
+        print("PALM VERIFIED")
+    elif result == "CANCELLED":
+        print("Scan cancelled.")
+    else:
+        print(result)
+    return result == "VERIFIED"
 
 
 # ------------------------------------------------------------------
