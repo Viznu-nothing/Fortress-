@@ -4,3 +4,4 @@ fortress_backups/
 protected_data/
 gemini_key.txt
 email_config.json
+fortress_palm_scan_enrollment.npz
