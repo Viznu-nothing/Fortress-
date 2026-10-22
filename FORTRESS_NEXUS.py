@@ -1160,12 +1160,19 @@ def draw(frame, title, status, color, lines=(), progress=None, rect=None):
 
 
 def open_camera():
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW) if sys.platform == "win32" else cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-    if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Retry: right after the face scan the webcam can still be held for a
+    # moment, so a single open would fail and the palm step would "fail"
+    # before its window ever appeared.
+    for attempt in range(4):
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW) if sys.platform == "win32" else cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(CAMERA_INDEX)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            return cap
+        cap.release()
+        time.sleep(0.4)
     return cap
 
 
@@ -4162,19 +4169,31 @@ $synth.Dispose()
             except Exception:
                 pass
 
-        self.root.after(0, self.palm_verification_done, result == "VERIFIED")
+        self.root.after(0, self.palm_verification_done, result)
 
     def palm_verification_done(
         self,
-        verified
+        result
     ):
 
         self.palm_scan_running = False
 
-        if verified:
+        if result == "VERIFIED":
             if state.get("PALM VERIFICATION") != "PASSED":
                 self.palm_pass()
-        elif state.get("PALM VERIFICATION") != "FAILED":
+            return
+
+        # A technical problem (no enrollment, webcam busy) is not an intruder;
+        # show the reason so it can be fixed, and let the user try again.
+        if isinstance(result, str) and result.startswith("ERROR"):
+            self.add_chat_message(
+                "NEXUS",
+                "Palm scan could not run: " + result[6:].lstrip(": ").strip()
+                + " Fix it and tap the palm button again.",
+                RED
+            )
+
+        if state.get("PALM VERIFICATION") != "FAILED":
             state["PALM VERIFICATION"] = "FAILED"
             state["PHONE PIN"] = "LOCKED"
             state["CARD VERIFICATION"] = "LOCKED"
