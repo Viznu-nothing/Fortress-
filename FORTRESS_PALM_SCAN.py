@@ -312,16 +312,16 @@ RED = (70, 70, 255)
 
 
 def enroll():
-    print("ENROLL: hold the SAME hand, palm facing the camera, fingers together,")
-    print("filling the box. Move it slightly between captures. 5 scans are taken.")
+    print("ENROLL (manual): hold the SAME hand, palm facing the camera, fingers")
+    print("together, filling the box. When the status says READY, press SPACE.")
+    print("Move the hand slightly between scans. R = retake last scan, ESC = cancel.")
     cap = open_camera()
     if not cap.isOpened():
         print("Could not open webcam.")
         return False
 
     grays, masks = [], []
-    good_since = None
-    last_capture = 0.0
+    message, message_color, message_until = "", CYAN, 0.0
     try:
         while len(grays) < ENROLL_SAMPLES:
             ok, frame = cap.read()
@@ -332,40 +332,54 @@ def enroll():
             gray, mask, problem = extract_palm(frame)
             now = time.time()
 
-            if problem:
-                good_since = None
+            if now < message_until:
+                status, color = message, message_color
+            elif problem:
                 status, color = problem, ORANGE
             else:
-                good_since = good_since or now
-                held = now - good_since
-                status, color = f"HOLD STILL... {max(0.0, 1.0 - held):.1f}s", CYAN
-                if held >= 1.0 and now - last_capture >= 1.5:
-                    # Each new scan must line up with the first one.
-                    if grays:
-                        first = prepare_enrolled(grays[:1], masks[:1])[0]
-                        kp, desc = features(gray, mask)
-                        n, d = compare((gray, mask, kp, desc), first)
-                        if n < MIN_INLIERS or d > MAX_CODE_DISTANCE:
-                            status, color = "SCAN DIDN'T MATCH FIRST ONE — SAME HAND, SAME POSE", RED
-                            good_since = None
-                            draw(frame, "FORTRESS PALM ENROLLMENT", status, color,
-                                 [f"Scans: {len(grays)}/{ENROLL_SAMPLES}"], len(grays) / ENROLL_SAMPLES)
-                            cv2.imshow(WINDOW, frame)
-                            cv2.waitKey(700)
-                            continue
-                    grays.append(gray)
-                    masks.append(mask)
-                    last_capture = now
-                    good_since = None
-                    status, color = f"SCAN {len(grays)} CAPTURED", GREEN
-                    print(f"  scan {len(grays)}/{ENROLL_SAMPLES} captured")
+                status, color = f"READY — PRESS SPACE FOR SCAN {len(grays) + 1}", GREEN
 
-            draw(frame, "FORTRESS PALM ENROLLMENT", status, color,
-                 [f"Scans: {len(grays)}/{ENROLL_SAMPLES}"], len(grays) / ENROLL_SAMPLES)
+            draw(frame, "FORTRESS PALM ENROLLMENT (MANUAL)", status, color,
+                 [f"Scans: {len(grays)}/{ENROLL_SAMPLES}",
+                  "SPACE = capture   R = retake last   ESC = cancel"],
+                 len(grays) / ENROLL_SAMPLES)
             cv2.imshow(WINDOW, frame)
-            if cv2.waitKey(1) & 0xFF == 27:
-                print("Enrollment cancelled.")
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == 27:
+                print("Enrollment cancelled. Nothing was saved.")
                 return False
+
+            if key in (ord("r"), ord("R")) and grays:
+                grays.pop()
+                masks.pop()
+                message, message_color, message_until = f"SCAN {len(grays) + 1} REMOVED", ORANGE, now + 1.2
+                print(f"  scan {len(grays) + 1} removed")
+                continue
+
+            if key != 32:   # SPACE
+                continue
+
+            if problem:
+                message, message_color, message_until = "NOT CAPTURED: " + problem, RED, now + 1.5
+                continue
+
+            # Each new scan must line up with the first one.
+            if grays:
+                first = prepare_enrolled(grays[:1], masks[:1])[0]
+                kp, desc = features(gray, mask)
+                n, d = compare((gray, mask, kp, desc), first)
+                if n < MIN_INLIERS or d > MAX_CODE_DISTANCE:
+                    message, message_color, message_until = (
+                        "NOT CAPTURED: DOESN'T MATCH SCAN 1 — SAME HAND, SAME POSE", RED, now + 2.0)
+                    print(f"  rejected: {n} aligned features, line distance "
+                          f"{d:.2f} vs scan 1")
+                    continue
+
+            grays.append(gray)
+            masks.append(mask)
+            message, message_color, message_until = f"SCAN {len(grays)} CAPTURED", GREEN, now + 1.0
+            print(f"  scan {len(grays)}/{ENROLL_SAMPLES} captured")
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -470,7 +484,7 @@ def main():
     print("FORTRESS PALM SCAN (palmprint, no landmarks)")
     print("Enrollment file:", ENROLLMENT_PATH)
     print("=" * 60)
-    print("1 = Enroll my palm")
+    print("1 = Enroll my palm (manual: press SPACE for each of 5 scans)")
     print("2 = Verify (scan)")
     choice = input("Choose 1 or 2: ").strip()
     if choice == "1":
