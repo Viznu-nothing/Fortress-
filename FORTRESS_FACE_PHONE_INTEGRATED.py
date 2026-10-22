@@ -2500,7 +2500,8 @@ class FortressHUD:
                 if status in (
                     "PASSED",
                     "INITIALIZED",
-                    "AUTHORIZED"
+                    "AUTHORIZED",
+                    "SENT"
                 )
                 else RED
                 if status in (
@@ -3812,6 +3813,28 @@ $synth.Dispose()
         self,
         backup_event
     ):
+
+        # Email result for a backup that was already announced.
+        if backup_event.get("kind") == "email":
+
+            if backup_event.get("ok"):
+                events.append((datetime.now().strftime("%H:%M:%S"), "BACKUP EMAILED", "SENT"))
+                self.add_chat_message(
+                    "NEXUS",
+                    f"Backup {backup_event.get('file')} emailed to {backup_event.get('to')}.",
+                    GREEN
+                )
+            else:
+                events.append((datetime.now().strftime("%H:%M:%S"), "BACKUP EMAIL", "FAILED"))
+                self.add_chat_message(
+                    "NEXUS",
+                    f"Backup was NOT emailed: {backup_event.get('error')}. "
+                    "It is still saved on this laptop.",
+                    RED
+                )
+
+            self.request_rebuild()
+            return
 
         self.security_alert = backup_event
         if backup_event.get("ok"):

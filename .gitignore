@@ -3,3 +3,4 @@ __pycache__/
 fortress_backups/
 protected_data/
 gemini_key.txt
+email_config.json

@@ -7,7 +7,9 @@ import os
 import time
 import pickle
 import shutil
+import smtplib
 import zipfile
+from email.message import EmailMessage
 import threading
 import subprocess
 import sys
@@ -61,6 +63,9 @@ state = {
 # PROTECTED_DATA_DIR are moved to the Recycle Bin so an intruder can't
 # reach them. Restore them from the Recycle Bin (right-click > Restore);
 # they go back into protected_data. Nothing is ever permanently deleted.
+#
+# The zip and the incident report are also emailed, if email_config.json
+# exists next to this file (see email_config.example.json).
 # ============================================================
 
 PROTECTED_DATA_DIR = Path(__file__).resolve().parent / "protected_data"
@@ -78,6 +83,71 @@ BACKUP_LOCK = threading.Lock()
 
 
 RECYCLE_ORIGINALS = True
+
+EMAIL_CONFIG_FILE = Path(__file__).resolve().parent / "email_config.json"
+MAX_EMAIL_ATTACHMENT_MB = 20   # Gmail's limit is 25 MB including encoding
+
+
+def load_email_config():
+    if not EMAIL_CONFIG_FILE.exists():
+        return None
+    config = json.loads(EMAIL_CONFIG_FILE.read_text(encoding="utf-8"))
+    missing = [key for key in ("sender", "app_password", "recipient") if not config.get(key)]
+    if missing:
+        raise RuntimeError(f"email_config.json is missing: {', '.join(missing)}")
+    return config
+
+
+def email_backup(archive, incident):
+    """Email the backup zip and incident report. Returns the recipient."""
+    config = load_email_config()
+    if config is None:
+        raise RuntimeError("email not set up (no email_config.json)")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"FORTRESS ALERT: {incident['trigger']}"
+    msg["From"] = config["sender"]
+    msg["To"] = config["recipient"]
+
+    size_mb = os.path.getsize(archive) / (1024 * 1024)
+    attach_zip = size_mb <= MAX_EMAIL_ATTACHMENT_MB
+
+    lines = [
+        "FORTRESS detected unauthorized access.",
+        "",
+        f"Time      : {incident['time']}",
+        f"Trigger   : {incident['trigger']}",
+        f"Detail    : {incident['detail']}",
+        f"From IP   : {incident['remote_addr']}",
+        f"Backup    : {Path(archive).name} ({size_mb:.1f} MB)"
+        + ("" if attach_zip else " — too large to attach, kept on the laptop"),
+    ]
+    if incident.get("moved_to_recycle_bin"):
+        lines.append("Recycled  : " + ", ".join(incident["moved_to_recycle_bin"]))
+    lines += ["", "The incident report is attached."]
+    msg.set_content("\n".join(lines))
+
+    if attach_zip:
+        msg.add_attachment(Path(archive).read_bytes(), maintype="application",
+                           subtype="zip", filename=Path(archive).name)
+    msg.add_attachment(json.dumps(incident, indent=2).encode("utf-8"), maintype="application",
+                       subtype="json", filename=f"incident_{Path(archive).stem[7:]}.json")
+
+    server = config.get("smtp_server", "smtp.gmail.com")
+    port = int(config.get("smtp_port", 587))
+    password = str(config["app_password"]).replace(" ", "")
+
+    if port == 465:
+        with smtplib.SMTP_SSL(server, port, timeout=30) as smtp:
+            smtp.login(config["sender"], password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(server, port, timeout=30) as smtp:
+            smtp.starttls()
+            smtp.login(config["sender"], password)
+            smtp.send_message(msg)
+
+    return config["recipient"]
 
 
 def send_to_recycle_bin(path):
@@ -163,9 +233,8 @@ def run_backup(trigger, detail, remote_addr, snapshot):
                 "recycle_failed": recycle_failed,
                 "recycle_error": recycle_error,
             }
-            (BACKUP_DIR / f"incident_{stamp}.json").write_text(
-                json.dumps(incident, indent=2), encoding="utf-8"
-            )
+            incident_path = BACKUP_DIR / f"incident_{stamp}.json"
+            incident_path.write_text(json.dumps(incident, indent=2), encoding="utf-8")
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — data backed up to {archive}")
             if recycled:
                 print(f"[FORTRESS] {len(recycled)} original item(s) moved to the Recycle Bin: "
@@ -175,6 +244,21 @@ def run_backup(trigger, detail, remote_addr, snapshot):
                                   "path": str(Path(archive).resolve()),
                                   "recycled": recycled, "recycle_failed": recycle_failed,
                                   "recycle_error": recycle_error})
+
+            # Email last: it can take a few seconds and the laptop alert
+            # should not wait for it. The HUD gets a second, email-only event.
+            try:
+                recipient = email_backup(archive, incident)
+                incident["emailed_to"] = recipient
+                print(f"[FORTRESS] backup emailed to {recipient}")
+                backup_events.append({"kind": "email", "ok": True, "to": recipient,
+                                      "file": Path(archive).name})
+            except Exception as exc:
+                incident["email_error"] = str(exc)
+                print(f"[FORTRESS] backup NOT emailed: {exc}")
+                backup_events.append({"kind": "email", "ok": False, "error": str(exc),
+                                      "file": Path(archive).name})
+            incident_path.write_text(json.dumps(incident, indent=2), encoding="utf-8")
         except Exception as exc:
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — BACKUP FAILED: {exc}")
             backup_events.append({"time": datetime.now().isoformat(timespec="seconds"),
@@ -2265,6 +2349,12 @@ if __name__ == "__main__":
     print("  Backups saved to    :", BACKUP_DIR)
     print("  Originals then go to: the Recycle Bin (restore from there)"
           if RECYCLE_ORIGINALS else "  Originals           : left in place")
+    try:
+        email_config = load_email_config()
+        print("  Emailed to          :", email_config["recipient"] if email_config
+              else "NOT SET UP — create email_config.json (see email_config.example.json)")
+    except Exception as exc:
+        print("  Emailed to          : NOT SET UP —", exc)
     print(f"  Triggers            : {MAX_LAYER_FAILURES} failures in a row on one layer, "
           f"{MAX_TOTAL_FAILURES} in total, or the final sequence typed on the phone")
     PROTECTED_DATA_DIR.mkdir(parents=True, exist_ok=True)

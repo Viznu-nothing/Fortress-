@@ -1,0 +1,7 @@
+{
+  "sender": "your.fortress.account@gmail.com",
+  "app_password": "abcd efgh ijkl mnop",
+  "recipient": "where.alerts.go@gmail.com",
+  "smtp_server": "smtp.gmail.com",
+  "smtp_port": 587
+}
