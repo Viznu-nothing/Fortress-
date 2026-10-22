@@ -58,10 +58,11 @@ BOX_FRACTION = 0.55       # scan box side, as a share of the frame height
 ENROLL_SAMPLES = 5
 
 # Quality gate
-MIN_SKIN_RATIO = 0.60     # share of the box that must look like skin
-MIN_SHARPNESS = 40.0      # variance of Laplacian
-MIN_BRIGHTNESS = 50
-MAX_BRIGHTNESS = 210
+MIN_FILL = 0.50           # share of the box covered by the palm
+MIN_SHARPNESS = 15.0      # variance of Laplacian over the palm
+MIN_BRIGHTNESS = 40
+MAX_BRIGHTNESS = 225
+FORCE_MIN_FILL = 0.30     # F (force capture) still needs this much palm
 
 # Alignment (ORB + RANSAC)
 ORB = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, nlevels=6, edgeThreshold=15)
@@ -108,35 +109,68 @@ def scan_box(frame):
     return x1, y1, x1 + side, y1 + side
 
 
-def skin_mask(bgr):
-    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-    mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    return mask
+def palm_mask(bgr):
+    """Pixels whose colour matches the centre of the box.
+
+    Learns the palm colour from the box centre instead of a fixed skin
+    range, so it works across skin tones and webcam white balance.
+    Returns (mask, centre_looks_like_skin).
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    h, w = lab.shape[:2]
+    centre = lab[int(h * 0.35):int(h * 0.65), int(w * 0.35):int(w * 0.65)].reshape(-1, 3)
+    L0, a0, b0 = np.median(centre, axis=0)
+
+    chroma = np.hypot(lab[..., 1] - a0, lab[..., 2] - b0)
+    mask = ((chroma < 18) & (np.abs(lab[..., 0] - L0) < 80)).astype(np.uint8) * 255
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Loose skin test on the centre (OpenCV Lab: a, b are offset by 128),
+    # so a plain wall or sleeve in the box is not taken as a palm.
+    skin_like = a0 > 130 and b0 > 128
+    return mask, skin_like
 
 
 def extract_palm(frame):
-    """Palm image from the scan box, or (None, reason) if quality is too low."""
+    """(palm image, mask, problem or None, readings) for the scan box."""
     x1, y1, x2, y2 = scan_box(frame)
     box = cv2.resize(frame[y1:y2, x1:x2], (ROI_SIZE, ROI_SIZE), interpolation=cv2.INTER_AREA)
-
-    mask = skin_mask(box)
-    skin_ratio = float(np.count_nonzero(mask)) / mask.size
-    if skin_ratio < MIN_SKIN_RATIO:
-        return None, None, "PLACE PALM TO FILL THE BOX"
-
     gray = cv2.cvtColor(box, cv2.COLOR_BGR2GRAY)
-    brightness = float(gray[mask > 0].mean())
-    if brightness < MIN_BRIGHTNESS:
-        return None, None, "TOO DARK — ADD LIGHT"
-    if brightness > MAX_BRIGHTNESS:
-        return None, None, "TOO BRIGHT — AVOID GLARE"
 
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F)[mask > 0].var())
-    if sharpness < MIN_SHARPNESS:
-        return None, None, "HOLD STILL — IMAGE BLURRED"
+    mask, skin_like = palm_mask(box)
+    on_palm = mask > 0
+    fill = float(np.count_nonzero(on_palm)) / mask.size
+    if fill > 0.02:
+        brightness = float(gray[on_palm].mean())
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F)[on_palm].var())
+    else:
+        brightness = sharpness = 0.0
+    readings = {"fill": fill, "brightness": brightness, "sharpness": sharpness,
+                "skin": skin_like}
 
-    return CLAHE.apply(gray), mask, None
+    if not skin_like:
+        problem = "NO PALM IN THE CENTRE OF THE BOX"
+    elif fill < MIN_FILL:
+        problem = "MOVE PALM CLOSER - FILL THE BOX"
+    elif brightness < MIN_BRIGHTNESS:
+        problem = "TOO DARK - ADD LIGHT"
+    elif brightness > MAX_BRIGHTNESS:
+        problem = "TOO BRIGHT - AVOID GLARE"
+    elif sharpness < MIN_SHARPNESS:
+        problem = "HOLD STILL - IMAGE BLURRED"
+    else:
+        problem = None
+
+    return CLAHE.apply(gray), mask, problem, readings
+
+
+def readings_line(r):
+    return (f"Fill {r['fill'] * 100:.0f}% (need {MIN_FILL * 100:.0f})  "
+            f"Light {r['brightness']:.0f} ({MIN_BRIGHTNESS}-{MAX_BRIGHTNESS})  "
+            f"Sharp {r['sharpness']:.0f} (need {MIN_SHARPNESS:.0f})  "
+            f"Skin {'yes' if r['skin'] else 'no'}")
 
 
 def competitive_code(gray):
@@ -329,7 +363,7 @@ def enroll():
                 print("Camera frame unavailable.")
                 return False
             frame = cv2.flip(frame, 1)
-            gray, mask, problem = extract_palm(frame)
+            gray, mask, problem, readings = extract_palm(frame)
             now = time.time()
 
             if now < message_until:
@@ -337,11 +371,12 @@ def enroll():
             elif problem:
                 status, color = problem, ORANGE
             else:
-                status, color = f"READY — PRESS SPACE FOR SCAN {len(grays) + 1}", GREEN
+                status, color = f"READY - PRESS SPACE FOR SCAN {len(grays) + 1}", GREEN
 
             draw(frame, "FORTRESS PALM ENROLLMENT (MANUAL)", status, color,
                  [f"Scans: {len(grays)}/{ENROLL_SAMPLES}",
-                  "SPACE = capture   R = retake last   ESC = cancel"],
+                  readings_line(readings),
+                  "SPACE = capture   F = force capture   R = retake last   ESC = cancel"],
                  len(grays) / ENROLL_SAMPLES)
             cv2.imshow(WINDOW, frame)
             key = cv2.waitKey(1) & 0xFF
@@ -357,11 +392,17 @@ def enroll():
                 print(f"  scan {len(grays) + 1} removed")
                 continue
 
-            if key != 32:   # SPACE
+            forced = key in (ord("f"), ord("F"))
+            if key != 32 and not forced:   # SPACE or F
                 continue
 
-            if problem:
-                message, message_color, message_until = "NOT CAPTURED: " + problem, RED, now + 1.5
+            if problem and not forced:
+                message, message_color, message_until = (
+                    "NOT CAPTURED: " + problem + " (F = force)", RED, now + 1.5)
+                continue
+            if forced and (not readings["skin"] or readings["fill"] < FORCE_MIN_FILL):
+                message, message_color, message_until = (
+                    "NOT CAPTURED: NO PALM IN THE BOX", RED, now + 1.5)
                 continue
 
             # Each new scan must line up with the first one.
@@ -371,7 +412,7 @@ def enroll():
                 n, d = compare((gray, mask, kp, desc), first)
                 if n < MIN_INLIERS or d > MAX_CODE_DISTANCE:
                     message, message_color, message_until = (
-                        "NOT CAPTURED: DOESN'T MATCH SCAN 1 — SAME HAND, SAME POSE", RED, now + 2.0)
+                        "NOT CAPTURED: DOESN'T MATCH SCAN 1 - SAME HAND, SAME POSE", RED, now + 2.0)
                     print(f"  rejected: {n} aligned features, line distance "
                           f"{d:.2f} vs scan 1")
                     continue
@@ -423,6 +464,7 @@ def verify():
     streak = 0
     last_eval = 0.0
     scores = []
+    readings = None
     status, color = "PLACE PALM IN THE BOX", CYAN
     verified = False
     try:
@@ -436,7 +478,7 @@ def verify():
 
             if now - last_eval >= EVAL_INTERVAL:
                 last_eval = now
-                gray, mask, problem = extract_palm(frame)
+                gray, mask, problem, readings = extract_palm(frame)
                 if problem:
                     streak, scores = 0, []
                     status, color = problem, ORANGE
@@ -454,7 +496,7 @@ def verify():
                     else:
                         status, color = "NO MATCH", RED
 
-            lines = []
+            lines = [readings_line(readings)] if readings else []
             if scores:
                 lines.append("Aligned features: " + " ".join(str(n) for n, _ in scores)
                              + f"  (need {cal['inlier_limit']})")
