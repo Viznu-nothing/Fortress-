@@ -146,14 +146,24 @@ _gemini_model = os.environ.get("GEMINI_MODEL") or None
 
 
 def get_gemini_key():
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if key:
-        return key.strip()
+    # Prefer the project's own key file. A stale GEMINI_API_KEY or
+    # GOOGLE_API_KEY environment variable must not override the key the
+    # user has placed beside this FORTRESS script.
     key_file = os.path.join(CURRENT_FOLDER, "gemini_key.txt")
     if os.path.isfile(key_file):
-        with open(key_file, "r", encoding="utf-8") as f:
-            return f.read().strip() or None
-    return None
+        with open(key_file, "r", encoding="utf-8-sig") as f:
+            key = f.read().strip()
+        # Tolerate accidental surrounding quotes or a pasted variable prefix.
+        if key.startswith(("\"", "'")) and key.endswith(("\"", "'")) and len(key) >= 2:
+            key = key[1:-1].strip()
+        if key.upper().startswith(("GEMINI_API_KEY=", "GOOGLE_API_KEY=")):
+            key = key.split("=", 1)[1].strip().strip("\"'")
+        if key:
+            return key
+
+    # Environment variables are only fallbacks when no usable project key exists.
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    return key.strip() if key and key.strip() else None
 
 
 def get_gemini_client():
