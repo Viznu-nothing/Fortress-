@@ -64,16 +64,24 @@ MIN_BRIGHTNESS = 40
 MAX_BRIGHTNESS = 225
 FORCE_MIN_FILL = 0.30     # F (force capture) still needs this much palm
 
-# Alignment (ORB + RANSAC)
+# Alignment, step 1: palm features (ORB + RANSAC homography)
 ORB = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, nlevels=6, edgeThreshold=15)
 MATCHER = cv2.BFMatcher(cv2.NORM_HAMMING)
 RATIO_TEST = 0.75
-MIN_INLIERS = 25          # never accept fewer aligned features than this
+MIN_INLIERS = 12          # features needed for step 1 to be used
 RANSAC_PIXELS = 4.0
+
+# Alignment, step 2 (when webcam palms have too few features): dense
+# whole-image alignment (ECC, rotation + shift)
+MIN_ECC = 0.55            # alignment quality needed, 0..1
+MAX_ROTATION_DEG = 30
+MAX_SHIFT_FRACTION = 0.4
 
 # Palm-line comparison (Competitive Code distance: 0 = identical, ~0.5 = random)
 MAX_CODE_DISTANCE = 0.36  # never accept a larger distance than this
 CODE_MARGIN = 0.05        # allowed above your own enrolled scans' distance
+ENROLL_MAX_DISTANCE = 0.40  # each enrollment scan vs scan 1
+SHIFT_SEARCH = 3          # code pixels of leftover shift to tolerate
 
 # Decision
 SAMPLE_AGREEMENT = 0.6    # 3 of 5 enrolled scans must match
@@ -176,6 +184,7 @@ def readings_line(r):
 def competitive_code(gray):
     """Per-pixel dominant palm-line orientation, 0..5."""
     small = cv2.resize(gray, (CODE_SIZE, CODE_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32)
+    small = cv2.GaussianBlur(small, (3, 3), 0)   # webcam noise is not palm lines
     responses = np.stack([cv2.filter2D(small, cv2.CV_32F, k) for k in GABOR_BANK])
     # Palm lines are dark, so the strongest line orientation gives the minimum response.
     return np.argmin(responses, axis=0).astype(np.uint8)
@@ -188,6 +197,22 @@ def code_distance(code_a, code_b, valid):
     diff = np.abs(code_a.astype(np.int16) - code_b.astype(np.int16))
     diff = np.minimum(diff, 6 - diff)          # orientations wrap around
     return float(diff[valid].mean() / 3.0)
+
+
+def shifted_code_distance(code_a, code_b, valid, max_shift=SHIFT_SEARCH):
+    """Smallest code distance over small shifts of code_a against code_b.
+
+    valid is in code_b's coordinates.
+    """
+    n = code_a.shape[0]
+    best = 1.0
+    for dy in range(-max_shift, max_shift + 1):
+        for dx in range(-max_shift, max_shift + 1):
+            a = code_a[max(0, dy):n + min(0, dy), max(0, dx):n + min(0, dx)]
+            b = code_b[max(0, -dy):n + min(0, -dy), max(0, -dx):n + min(0, -dx)]
+            v = valid[max(0, -dy):n + min(0, -dy), max(0, -dx):n + min(0, -dx)]
+            best = min(best, code_distance(a, b, v))
+    return best
 
 
 def features(gray, mask):
@@ -221,31 +246,89 @@ def sane_homography(H):
     return 0.6 < det < 1.6 and perspective < 0.002
 
 
-def compare(live, enrolled):
-    """(inliers, code distance) of a live palm against one enrolled scan."""
-    live_gray, live_mask, live_kp, live_desc = live
-    ref_gray, ref_mask, ref_kp, ref_desc, ref_code = enrolled
-
+def align_features(live_kp, live_desc, ref_kp, ref_desc):
+    """Homography live -> enrolled from palm features, or (None, inliers)."""
     pairs = mutual_matches(live_desc, ref_desc)
     if len(pairs) < MIN_INLIERS:
-        return len(pairs), 1.0
-
-    src = np.float32([live_kp[a].pt for a, _ in pairs]).reshape(-1, 1, 2)
-    dst = np.float32([ref_kp[b].pt for _, b in pairs]).reshape(-1, 1, 2)
-    H, inlier_mask = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_PIXELS)
+        return None, len(pairs)
+    src_pts = np.float32([live_kp[a].pt for a, _ in pairs]).reshape(-1, 1, 2)
+    dst_pts = np.float32([ref_kp[b].pt for _, b in pairs]).reshape(-1, 1, 2)
+    H, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, RANSAC_PIXELS)
     inliers = int(inlier_mask.sum()) if inlier_mask is not None else 0
     if inliers < MIN_INLIERS or not sane_homography(H):
-        return inliers, 1.0
+        return None, inliers
+    return H, inliers
 
-    # Line up the live palm with the enrolled one, then compare palm lines
-    # only where both images show palm skin.
-    warped = cv2.warpPerspective(live_gray, H, (ROI_SIZE, ROI_SIZE))
-    warped_mask = cv2.warpPerspective(live_mask, H, (ROI_SIZE, ROI_SIZE))
+
+def ecc_image(gray):
+    small = cv2.resize(gray, (CODE_SIZE, CODE_SIZE), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(small.astype(np.float32) / 255.0, (5, 5), 0)
+
+
+def align_dense(live_gray, live_mask, ref_gray):
+    """Rotation + shift (2x3, ROI scale) mapping enrolled -> live coordinates,
+    for use with WARP_INVERSE_MAP, and its quality 0..1. (None, 0) if it fails."""
+    template = ecc_image(ref_gray)
+    moving = ecc_image(live_gray)
+    moving_mask = cv2.resize(live_mask, (CODE_SIZE, CODE_SIZE), interpolation=cv2.INTER_NEAREST)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-4)
+
+    starts = [np.eye(2, 3, dtype=np.float32)]
+    try:
+        (dx, dy), _ = cv2.phaseCorrelate(template, moving)
+        shifted = np.eye(2, 3, dtype=np.float32)
+        shifted[0, 2], shifted[1, 2] = dx, dy
+        starts.append(shifted)
+    except cv2.error:
+        pass
+
+    best_cc, best_warp = 0.0, None
+    for start in starts:
+        try:
+            cc, warp = cv2.findTransformECC(template, moving, start.copy(), cv2.MOTION_EUCLIDEAN,
+                                            criteria, moving_mask, 5)
+        except cv2.error:
+            continue
+        if cc > best_cc:
+            best_cc, best_warp = cc, warp
+
+    if best_warp is None:
+        return None, 0.0
+    rotation = abs(np.degrees(np.arctan2(best_warp[1, 0], best_warp[0, 0])))
+    shift = max(abs(best_warp[0, 2]), abs(best_warp[1, 2])) / CODE_SIZE
+    if rotation > MAX_ROTATION_DEG or shift > MAX_SHIFT_FRACTION:
+        return None, best_cc
+    warp = best_warp.copy()
+    warp[:, 2] *= ROI_SIZE / CODE_SIZE
+    return warp, float(best_cc)
+
+
+def compare(live, enrolled):
+    """(aligned, code distance, how it aligned) of a live palm vs one enrolled scan."""
+    live_gray, live_mask, live_kp, live_desc = live
+    ref_gray, ref_mask, ref_kp, ref_desc, ref_code = enrolled
+    size = (ROI_SIZE, ROI_SIZE)
+
+    H, inliers = align_features(live_kp, live_desc, ref_kp, ref_desc)
+    if H is not None:
+        warped = cv2.warpPerspective(live_gray, H, size)
+        warped_mask = cv2.warpPerspective(live_mask, H, size, flags=cv2.INTER_NEAREST)
+        method = f"F{inliers}"
+    else:
+        warp, quality = align_dense(live_gray, live_mask, ref_gray)
+        if warp is None or quality < MIN_ECC:
+            return False, 1.0, "--"
+        inverse = cv2.WARP_INVERSE_MAP
+        warped = cv2.warpAffine(live_gray, warp, size, flags=cv2.INTER_LINEAR | inverse)
+        warped_mask = cv2.warpAffine(live_mask, warp, size, flags=cv2.INTER_NEAREST | inverse)
+        method = f"D{quality:.2f}"
+
+    # Compare palm lines only where both images show palm.
     both = cv2.bitwise_and(warped_mask, ref_mask)
     valid = cv2.resize(both, (CODE_SIZE, CODE_SIZE), interpolation=cv2.INTER_NEAREST) > 0
     valid = cv2.erode(valid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0   # skip edges
 
-    return inliers, code_distance(competitive_code(warped), ref_code, valid)
+    return True, shifted_code_distance(competitive_code(warped), ref_code, valid), method
 
 
 # ------------------------------------------------------------------
@@ -262,24 +345,19 @@ def prepare_enrolled(grays, masks):
 
 def calibrate(enrolled):
     """Thresholds from how well your own enrolled scans match each other."""
-    inliers, distances = [], []
+    distances = []
     for i in range(len(enrolled)):
         for j in range(len(enrolled)):
             if i == j:
                 continue
             gray, mask, kp, desc, _ = enrolled[i]
-            n, d = compare((gray, mask, kp, desc), enrolled[j])
-            inliers.append(n)
-            distances.append(d)
+            aligned, d, _ = compare((gray, mask, kp, desc), enrolled[j])
+            distances.append(d if aligned else 1.0)
     good = [d for d in distances if d < 1.0]
     genuine_distance = float(np.median(good)) if good else 1.0
-    distance_limit = min(MAX_CODE_DISTANCE, genuine_distance + CODE_MARGIN)
-    inlier_limit = max(MIN_INLIERS, int(np.median(inliers) * 0.4)) if inliers else MIN_INLIERS
     return {
-        "inlier_limit": inlier_limit,
-        "distance_limit": distance_limit,
+        "distance_limit": min(MAX_CODE_DISTANCE, genuine_distance + CODE_MARGIN),
         "genuine_distance": genuine_distance,
-        "pair_inliers": inliers,
         "pair_distances": distances,
     }
 
@@ -409,13 +487,19 @@ def enroll():
             if grays:
                 first = prepare_enrolled(grays[:1], masks[:1])[0]
                 kp, desc = features(gray, mask)
-                n, d = compare((gray, mask, kp, desc), first)
-                if n < MIN_INLIERS or d > MAX_CODE_DISTANCE:
+                aligned, d, how = compare((gray, mask, kp, desc), first)
+                if not aligned:
                     message, message_color, message_until = (
-                        "NOT CAPTURED: DOESN'T MATCH SCAN 1 - SAME HAND, SAME POSE", RED, now + 2.0)
-                    print(f"  rejected: {n} aligned features, line distance "
-                          f"{d:.2f} vs scan 1")
+                        "NOT CAPTURED: COULDN'T LINE UP WITH SCAN 1 - KEEP PALM CENTRED", RED, now + 2.0)
+                    print("  rejected: could not align with scan 1")
                     continue
+                if d > ENROLL_MAX_DISTANCE:
+                    message, message_color, message_until = (
+                        f"NOT CAPTURED: LINES DIFFER FROM SCAN 1 ({d:.2f}, need <= {ENROLL_MAX_DISTANCE:.2f})",
+                        RED, now + 2.0)
+                    print(f"  rejected: line distance {d:.2f} vs scan 1 (aligned {how})")
+                    continue
+                print(f"  vs scan 1: line distance {d:.2f} (aligned {how})")
 
             grays.append(gray)
             masks.append(mask)
@@ -426,8 +510,8 @@ def enroll():
         cv2.destroyAllWindows()
 
     cal = calibrate(prepare_enrolled(grays, masks))
-    print(f"Your scans vs each other: distance {cal['genuine_distance']:.3f}, "
-          f"inliers {sorted(cal['pair_inliers'])}")
+    print(f"Your scans vs each other: typical line distance {cal['genuine_distance']:.3f} "
+          f"-> verify limit {cal['distance_limit']:.3f}")
     if cal["genuine_distance"] > MAX_CODE_DISTANCE:
         print("Your 5 scans are not consistent enough. Enroll again with brighter,")
         print("even light, the palm flat and filling the box. Nothing was saved.")
@@ -452,7 +536,7 @@ def verify():
     enrolled = prepare_enrolled(grays, masks)
     cal = calibrate(enrolled)
     required = max(1, int(np.ceil(len(enrolled) * SAMPLE_AGREEMENT)))
-    print(f"Thresholds: inliers >= {cal['inlier_limit']}, palm-line distance <= "
+    print(f"Thresholds: palm-line distance <= "
           f"{cal['distance_limit']:.3f} (your scans: {cal['genuine_distance']:.3f}), "
           f"{required} of {len(enrolled)} scans, {REQUIRED_CONSECUTIVE} checks in a row")
 
@@ -485,8 +569,8 @@ def verify():
                 else:
                     kp, desc = features(gray, mask)
                     scores = [compare((gray, mask, kp, desc), ref) for ref in enrolled]
-                    agreeing = sum(1 for n, d in scores
-                                   if n >= cal["inlier_limit"] and d <= cal["distance_limit"])
+                    agreeing = sum(1 for aligned, d, _ in scores
+                                   if aligned and d <= cal["distance_limit"])
                     streak = streak + 1 if agreeing >= required else 0
                     if streak >= REQUIRED_CONSECUTIVE:
                         verified = True
@@ -498,9 +582,9 @@ def verify():
 
             lines = [readings_line(readings)] if readings else []
             if scores:
-                lines.append("Aligned features: " + " ".join(str(n) for n, _ in scores)
-                             + f"  (need {cal['inlier_limit']})")
-                lines.append("Line distance: " + " ".join(f"{d:.2f}" if d < 1 else "--" for _, d in scores)
+                lines.append("Alignment: " + " ".join(how for _, _, how in scores)
+                             + "  (F = features, D = dense)")
+                lines.append("Line distance: " + " ".join(f"{d:.2f}" if d < 1 else "--" for _, d, _ in scores)
                              + f"  (need <= {cal['distance_limit']:.2f})")
             draw(frame, "FORTRESS PALM SCAN", status, color, lines, streak / REQUIRED_CONSECUTIVE)
             cv2.imshow(WINDOW, frame)
