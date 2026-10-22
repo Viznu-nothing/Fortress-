@@ -78,9 +78,15 @@ MAX_ROTATION_DEG = 30
 MAX_SHIFT_FRACTION = 0.4
 
 # Palm-line comparison (Competitive Code distance: 0 = identical, ~0.5 = random)
-MAX_CODE_DISTANCE = 0.36  # never accept a larger distance than this
-CODE_MARGIN = 0.05        # allowed above your own enrolled scans' distance
-ENROLL_MAX_DISTANCE = 0.40  # each enrollment scan vs scan 1
+# A live scan always runs a little above how well the enrolled scans match
+# each other (lighting and pose differ), so the per-scan limit sits well
+# above that self-distance. The real security is still SAMPLE_AGREEMENT +
+# REQUIRED_CONSECUTIVE below: an impostor must clear the limit on several
+# scans for several frames in a row.
+MIN_CODE_DISTANCE = 0.32  # never set the limit tighter than this
+MAX_CODE_DISTANCE = 0.42  # never set the limit looser than this
+CODE_MARGIN = 0.12        # allowed above your own enrolled scans' distance
+ENROLL_MAX_DISTANCE = 0.44  # each enrollment scan vs scan 1
 SHIFT_SEARCH = 3          # code pixels of leftover shift to tolerate
 
 # Decision
@@ -356,7 +362,7 @@ def calibrate(enrolled):
     good = [d for d in distances if d < 1.0]
     genuine_distance = float(np.median(good)) if good else 1.0
     return {
-        "distance_limit": min(MAX_CODE_DISTANCE, genuine_distance + CODE_MARGIN),
+        "distance_limit": min(MAX_CODE_DISTANCE, max(MIN_CODE_DISTANCE, genuine_distance + CODE_MARGIN)),
         "genuine_distance": genuine_distance,
         "pair_distances": distances,
     }
@@ -512,7 +518,7 @@ def enroll():
     cal = calibrate(prepare_enrolled(grays, masks))
     print(f"Your scans vs each other: typical line distance {cal['genuine_distance']:.3f} "
           f"-> verify limit {cal['distance_limit']:.3f}")
-    if cal["genuine_distance"] > MAX_CODE_DISTANCE:
+    if cal["genuine_distance"] > ENROLL_MAX_DISTANCE:
         print("Your 5 scans are not consistent enough. Enroll again with brighter,")
         print("even light, the palm flat and filling the box. Nothing was saved.")
         return False
