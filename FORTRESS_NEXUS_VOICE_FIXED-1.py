@@ -209,8 +209,27 @@ def get_gemini_client():
         key = get_gemini_key(verbose=True)
         if not key:
             raise RuntimeError("NO_GEMINI_KEY")
-        _gemini_client = genai.Client(api_key=key)
+        # Give slow networks more time before "not responding". Fall back if
+        # this google-genai version doesn't accept http_options.
+        try:
+            _gemini_client = genai.Client(
+                api_key=key,
+                http_options=genai_types.HttpOptions(timeout=30000),
+            )
+        except Exception:
+            _gemini_client = genai.Client(api_key=key)
     return _gemini_client
+
+
+def _is_transient_error(error):
+    """Temporary problem worth a quick retry (overloaded, timeout, 5xx)."""
+    text = str(error).lower()
+    code = getattr(error, "code", None)
+    if isinstance(code, int) and code >= 500:
+        return True
+    return any(w in text for w in (
+        "overloaded", "unavailable", "try again", "timeout", "timed out",
+        "deadline", "temporarily", "503", "502", "500", "connection reset"))
 
 
 def discover_gemini_models(client):
@@ -257,24 +276,29 @@ def ask_gemini(prompt):
     last_error = None
 
     for model in models:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config,
-            )
-            answer = (getattr(response, "text", None) or "").strip()
-            if not answer:
-                last_error = RuntimeError("Gemini returned an empty response")
-                continue
-            _gemini_model = model
-            print("NEXUS AI: using Gemini model", model)
-            return answer
-        except Exception as error:
-            last_error = error
-            print("NEXUS AI model failed:", model, type(error).__name__, error)
-            # Keep trying other supported models for 404, quota, transient, or model errors.
-            continue
+        # Retry a model up to 3 times when the server is momentarily
+        # overloaded or slow ("not responding / try again later").
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                answer = (getattr(response, "text", None) or "").strip()
+                if not answer:
+                    last_error = RuntimeError("Gemini returned an empty response")
+                    break
+                _gemini_model = model
+                print("NEXUS AI: using Gemini model", model)
+                return answer
+            except Exception as error:
+                last_error = error
+                print("NEXUS AI model failed:", model, type(error).__name__, error)
+                if _is_transient_error(error) and attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break   # move on to the next model
 
     _gemini_model = None
     if last_error:
