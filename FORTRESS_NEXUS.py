@@ -133,9 +133,13 @@ except Exception as error:
 # ============================================================
 
 GEMINI_MODELS = [
-    "gemini-3.5-flash",
-    "gemini-3-flash-preview",
     "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-preview",
+    "gemini-pro-latest",
 ]
 
 # Room for the model's own thinking plus a short spoken answer.
@@ -212,8 +216,38 @@ def get_gemini_client():
     return _gemini_client
 
 
+def _is_model_not_found(error):
+    text = str(error).lower()
+    return (getattr(error, "code", None) == 404
+            or "not_found" in text or "not found" in text
+            or "is not supported" in text or "not supported for" in text)
+
+
+def discover_gemini_models(client):
+    """Model ids this key can actually use for generateContent (flash first)."""
+    try:
+        names = []
+        for model in client.models.list():
+            name = (getattr(model, "name", "") or "").split("/")[-1]
+            if not name:
+                continue
+            methods = (getattr(model, "supported_actions", None)
+                       or getattr(model, "supported_generation_methods", None) or [])
+            if methods and not any("generatecontent" in str(m).lower() for m in methods):
+                continue
+            names.append(name)
+        flash = [n for n in names if "flash" in n.lower()]
+        pro = [n for n in names if "pro" in n.lower() and n not in flash]
+        rest = [n for n in names if n not in flash and n not in pro]
+        return flash + pro + rest
+    except Exception as exc:
+        print("NEXUS AI: could not list Gemini models -", exc)
+        return []
+
+
 def ask_gemini(prompt):
-    """Return Gemini's answer text. Tries the model list until one works."""
+    """Return Gemini's answer text. Tries the known model list, then the
+    models this key actually has, until one works."""
     global _gemini_model
     client = get_gemini_client()
     config = genai_types.GenerateContentConfig(
@@ -221,9 +255,15 @@ def ask_gemini(prompt):
         temperature=0.4,
     )
 
-    models = [_gemini_model] if _gemini_model else GEMINI_MODELS
-    last_error = None
+    if _gemini_model:
+        models = [_gemini_model]
+    else:
+        models = list(GEMINI_MODELS)
+        for name in discover_gemini_models(client):
+            if name not in models:
+                models.append(name)
 
+    last_error = None
     for model in models:
         try:
             response = client.models.generate_content(
@@ -232,8 +272,9 @@ def ask_gemini(prompt):
                 config=config,
             )
         except Exception as error:
-            # Unknown model for this key: try the next one.
-            if getattr(error, "code", None) == 404 and not _gemini_model:
+            # Unknown model for this key: try the next one. Any other error
+            # (bad key, no quota, no internet) is real — stop and report it.
+            if not _gemini_model and _is_model_not_found(error):
                 last_error = error
                 continue
             raise
@@ -244,7 +285,7 @@ def ask_gemini(prompt):
 
         return (response.text or "").strip()
 
-    raise last_error
+    raise last_error if last_error else RuntimeError("no Gemini model available for this key")
 
 CURRENT_FOLDER = os.path.dirname(
     os.path.abspath(__file__)
@@ -4475,7 +4516,9 @@ $synth.Dispose()
 
         self.add_chat_message("NEXUS", message, RED)
         self.request_rebuild()
-        self.show_backup_alert(backup_event)
+        # Pop-up window disabled by request; the red SECURITY STATE panel,
+        # the NEXUS chat line and the event log still show the alert.
+        # self.show_backup_alert(backup_event)
 
     def show_backup_alert(
         self,
