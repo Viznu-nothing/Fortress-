@@ -989,6 +989,23 @@ def describe_ai_error(error):
     return type(error).__name__ + ": " + str(error)[:80]
 
 
+def recycle_summary(backup_event):
+    """One line on what happened to the original files."""
+    moved = backup_event.get("recycled") or []
+    failed = backup_event.get("recycle_failed") or []
+    error = backup_event.get("recycle_error")
+
+    if error:
+        return "Originals left in place: " + error[:80]
+    if not moved and not failed:
+        return "protected_data was empty, nothing to move."
+
+    text = f"{len(moved)} original item(s) moved to the Recycle Bin."
+    if failed:
+        text += f" Could not move: {', '.join(failed)[:60]}."
+    return text
+
+
 class FortressHUD:
 
     def __init__(self, root):
@@ -1102,6 +1119,12 @@ class FortressHUD:
         self.root.bind(
             "<F3>",
             self.open_latest_backup
+        )
+
+        # F4 opens the Recycle Bin, where moved originals can be restored.
+        self.root.bind(
+            "<F4>",
+            self.open_recycle_bin
         )
 
         # ====================================================
@@ -3806,7 +3829,8 @@ $synth.Dispose()
             message = (
                 f"ALERT: unauthorized access detected ({trigger.lower()}). "
                 f"Protected data backed up to {backup_event.get('path') or backup_event.get('file')}. "
-                f"Press F3 to open the backup folder."
+                + recycle_summary(backup_event)
+                + " Press F3 for the backup folder, F4 for the Recycle Bin."
             )
         else:
             message = (
@@ -3829,7 +3853,7 @@ $synth.Dispose()
         window.attributes("-topmost", True)
 
         width = max(420, int(760 * self.scale))
-        height = max(240, int(320 * self.scale))
+        height = max(270, int(360 * self.scale))
         x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
         y = self.root.winfo_rooty() + int(self.offset_y + 140 * self.scale)
         window.geometry(f"{width}x{height}+{x}+{y}")
@@ -3877,24 +3901,40 @@ $synth.Dispose()
                 font=("Segoe UI", max(8, int(9 * self.scale)))
             ).pack(pady=(6, 0))
 
-            def open_and_close():
-                self.open_backup(backup_event)
+            tk.Label(
+                inner,
+                text=recycle_summary(backup_event).upper(),
+                bg="#1A0509",
+                fg=RED if backup_event.get("recycle_error") or backup_event.get("recycle_failed") else GREEN,
+                wraplength=width - 40,
+                font=("Segoe UI", max(8, int(9 * self.scale)), "bold")
+            ).pack(pady=(4, 0))
+
+            buttons = tk.Frame(inner, bg="#1A0509")
+            buttons.pack(pady=(8, 0))
+
+            def run_and_close(action):
+                action(backup_event)
                 window.destroy()
 
-            tk.Button(
-                inner,
-                text="OPEN BACKUP FOLDER  (F3)",
-                command=open_and_close,
-                bg="#3A0D14",
-                fg=WHITE,
-                activebackground=RED,
-                activeforeground=WHITE,
-                relief="flat",
-                bd=0,
-                padx=14,
-                pady=4,
-                font=("Segoe UI", max(8, int(10 * self.scale)), "bold")
-            ).pack(pady=(8, 0))
+            for label, action in (
+                ("OPEN BACKUP FOLDER  (F3)", self.open_backup),
+                ("OPEN RECYCLE BIN  (F4)", lambda _event: self.open_recycle_bin()),
+            ):
+                tk.Button(
+                    buttons,
+                    text=label,
+                    command=lambda action=action: run_and_close(action),
+                    bg="#3A0D14",
+                    fg=WHITE,
+                    activebackground=RED,
+                    activeforeground=WHITE,
+                    relief="flat",
+                    bd=0,
+                    padx=14,
+                    pady=4,
+                    font=("Segoe UI", max(8, int(10 * self.scale)), "bold")
+                ).pack(side="left", padx=6)
 
         def close_popup():
             try:
@@ -3913,6 +3953,19 @@ $synth.Dispose()
             self.open_backup(self.latest_backup)
         else:
             self.add_chat_message("NEXUS", "No intrusion backup has been made yet.", CYAN)
+
+    def open_recycle_bin(
+        self,
+        event=None
+    ):
+
+        try:
+            if os.name == "nt":
+                subprocess.Popen("explorer shell:RecycleBinFolder")
+            else:
+                print("Recycle Bin can only be opened on Windows.")
+        except Exception as error:
+            print("Could not open Recycle Bin:", error)
 
     def open_backup(
         self,

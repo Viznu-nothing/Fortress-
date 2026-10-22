@@ -7,6 +7,7 @@ import os
 import time
 import pickle
 import shutil
+import zipfile
 import threading
 import subprocess
 import sys
@@ -55,6 +56,11 @@ state = {
 #   - MAX_TOTAL_FAILURES failures pile up across all layers, or
 #   - someone types the symbols on the phone at the final sequence
 #     stage (the real owner never types them; they say the phrase).
+#
+# After the zip is made and checked, the original files in
+# PROTECTED_DATA_DIR are moved to the Recycle Bin so an intruder can't
+# reach them. Restore them from the Recycle Bin (right-click > Restore);
+# they go back into protected_data. Nothing is ever permanently deleted.
 # ============================================================
 
 PROTECTED_DATA_DIR = Path(__file__).resolve().parent / "protected_data"
@@ -71,6 +77,61 @@ backup_events = []   # read by the laptop HUD via /backup_events
 BACKUP_LOCK = threading.Lock()
 
 
+RECYCLE_ORIGINALS = True
+
+
+def send_to_recycle_bin(path):
+    """Move one file or folder to the Recycle Bin (restorable). Raises on failure."""
+    try:
+        from send2trash import send2trash   # pip install Send2Trash
+        send2trash(str(path))
+        return
+    except ImportError:
+        pass
+
+    if os.name != "nt":
+        raise RuntimeError("Recycle Bin needs Windows or the Send2Trash package")
+
+    # Windows without Send2Trash: use the built-in .NET Recycle Bin call.
+    kind = "DeleteDirectory" if Path(path).is_dir() else "DeleteFile"
+    script = (
+        "Add-Type -AssemblyName Microsoft.VisualBasic; "
+        f"[Microsoft.VisualBasic.FileIO.FileSystem]::{kind}("
+        "$env:FORTRESS_RECYCLE_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        env=dict(os.environ, FORTRESS_RECYCLE_PATH=str(Path(path).resolve())),
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0 or Path(path).exists():
+        raise RuntimeError(result.stderr.strip() or "file is still in place")
+
+
+def recycle_protected_data(archive):
+    """Move every item in PROTECTED_DATA_DIR to the Recycle Bin, but only if
+    the zip really holds all of them. Returns (moved names, failed names)."""
+    items = sorted(PROTECTED_DATA_DIR.iterdir())
+    if not items:
+        return [], []
+
+    with zipfile.ZipFile(archive) as z:
+        zipped = {name.split("/")[0] for name in z.namelist()}
+    missing = [item.name for item in items if item.name not in zipped]
+    if missing:
+        raise RuntimeError(f"zip is missing {', '.join(missing)}; originals left in place")
+
+    moved, failed = [], []
+    for item in items:
+        try:
+            send_to_recycle_bin(item)
+            moved.append(item.name)
+        except Exception as exc:
+            print(f"[FORTRESS] could not recycle {item.name}: {exc}")
+            failed.append(item.name)
+    return moved, failed
+
+
 def run_backup(trigger, detail, remote_addr, snapshot):
     with BACKUP_LOCK:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -82,6 +143,14 @@ def run_backup(trigger, detail, remote_addr, snapshot):
                 str(BACKUP_DIR / f"backup_{stamp}"), "zip", root_dir=str(PROTECTED_DATA_DIR)
             )
 
+            recycled, recycle_failed, recycle_error = [], [], ""
+            if RECYCLE_ORIGINALS:
+                try:
+                    recycled, recycle_failed = recycle_protected_data(archive)
+                except Exception as exc:
+                    recycle_error = str(exc)
+                    print(f"[FORTRESS] originals NOT moved to Recycle Bin: {exc}")
+
             incident = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "trigger": trigger,
@@ -90,14 +159,22 @@ def run_backup(trigger, detail, remote_addr, snapshot):
                 "failures": snapshot["failures"],
                 "state": snapshot["state"],
                 "backup_file": Path(archive).name,
+                "moved_to_recycle_bin": recycled,
+                "recycle_failed": recycle_failed,
+                "recycle_error": recycle_error,
             }
             (BACKUP_DIR / f"incident_{stamp}.json").write_text(
                 json.dumps(incident, indent=2), encoding="utf-8"
             )
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — data backed up to {archive}")
+            if recycled:
+                print(f"[FORTRESS] {len(recycled)} original item(s) moved to the Recycle Bin: "
+                      + ", ".join(recycled))
             backup_events.append({"time": incident["time"], "trigger": trigger, "ok": True,
                                   "file": Path(archive).name, "folder": str(BACKUP_DIR),
-                                  "path": str(Path(archive).resolve())})
+                                  "path": str(Path(archive).resolve()),
+                                  "recycled": recycled, "recycle_failed": recycle_failed,
+                                  "recycle_error": recycle_error})
         except Exception as exc:
             print(f"[FORTRESS] UNAUTHORIZED ACCESS: {trigger} — BACKUP FAILED: {exc}")
             backup_events.append({"time": datetime.now().isoformat(timespec="seconds"),
@@ -2186,6 +2263,8 @@ if __name__ == "__main__":
     print("INTRUSION BACKUP: ARMED")
     print("  Data backed up from :", PROTECTED_DATA_DIR)
     print("  Backups saved to    :", BACKUP_DIR)
+    print("  Originals then go to: the Recycle Bin (restore from there)"
+          if RECYCLE_ORIGINALS else "  Originals           : left in place")
     print(f"  Triggers            : {MAX_LAYER_FAILURES} failures in a row on one layer, "
           f"{MAX_TOTAL_FAILURES} in total, or the final sequence typed on the phone")
     PROTECTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
