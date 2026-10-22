@@ -1,8 +1,8 @@
 """
 FORTRESS PALM SCAN — palmprint enrollment and verification (no hand landmarks)
 
-Place your palm inside the scan box on screen. The scanner:
-  1. checks the image is good enough (skin fills the box, sharp, well lit),
+Hold your palm up to the camera (anywhere in view). The scanner:
+  1. finds your palm in the frame and checks the image (sharp, well lit),
   2. finds palm-line features (ORB) and aligns your palm to each enrolled
      scan with a RANSAC homography, so position and angle can vary a little,
   3. compares the aligned palm lines with a Competitive Code (6 Gabor
@@ -58,7 +58,7 @@ BOX_FRACTION = 0.55       # scan box side, as a share of the frame height
 ENROLL_SAMPLES = 5
 
 # Quality gate
-MIN_FILL = 0.50           # share of the box covered by the palm
+MIN_FILL = 0.40           # share of the detected crop covered by the palm
 MIN_SHARPNESS = 15.0      # variance of Laplacian over the palm
 MIN_BRIGHTNESS = 40
 MAX_BRIGHTNESS = 225
@@ -117,17 +117,43 @@ def make_gabor_bank():
 GABOR_BANK = make_gabor_bank()
 
 
-def scan_box(frame):
+PALM_MIN_AREA = 0.04      # largest skin blob must be >= this share of the frame
+
+
+def locate_palm(frame):
+    """Square region around the largest hand/palm anywhere in the frame,
+    or None when no hand-sized skin region is found. No fixed box: the
+    palm can be held wherever is comfortable."""
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 182, 135))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+
+    contours, _ = cv2.findContours(skin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    hand = max(contours, key=cv2.contourArea)
+
     h, w = frame.shape[:2]
-    side = int(h * BOX_FRACTION)
-    x1, y1 = (w - side) // 2, (h - side) // 2
-    return x1, y1, x1 + side, y1 + side
+    if cv2.contourArea(hand) < PALM_MIN_AREA * h * w:
+        return None
+
+    bx, by, bw, bh = cv2.boundingRect(hand)
+    cx, cy = bx + bw / 2.0, by + bh / 2.0
+    side = max(bw, bh) * 1.1
+    x1 = int(max(0, cx - side / 2.0))
+    y1 = int(max(0, cy - side / 2.0))
+    x2 = int(min(w, cx + side / 2.0))
+    y2 = int(min(h, cy + side / 2.0))
+    if x2 - x1 < 60 or y2 - y1 < 60:
+        return None
+    return x1, y1, x2, y2
 
 
 def palm_mask(bgr):
-    """Pixels whose colour matches the centre of the box.
+    """Pixels whose colour matches the centre of the crop.
 
-    Learns the palm colour from the box centre instead of a fixed skin
+    Learns the palm colour from the crop centre instead of a fixed skin
     range, so it works across skin tones and webcam white balance.
     Returns (mask, centre_looks_like_skin).
     """
@@ -149,12 +175,18 @@ def palm_mask(bgr):
 
 
 def extract_palm(frame):
-    """(palm image, mask, problem or None, readings) for the scan box."""
-    x1, y1, x2, y2 = scan_box(frame)
-    box = cv2.resize(frame[y1:y2, x1:x2], (ROI_SIZE, ROI_SIZE), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(box, cv2.COLOR_BGR2GRAY)
+    """(palm image, mask, problem or None, readings) for the palm found
+    anywhere in the frame. readings['rect'] is where it was located."""
+    rect = locate_palm(frame)
+    if rect is None:
+        return (None, None, "SHOW YOUR PALM TO THE CAMERA",
+                {"fill": 0.0, "brightness": 0.0, "sharpness": 0.0, "skin": False, "rect": None})
 
-    mask, skin_like = palm_mask(box)
+    x1, y1, x2, y2 = rect
+    crop = cv2.resize(frame[y1:y2, x1:x2], (ROI_SIZE, ROI_SIZE), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    mask, skin_like = palm_mask(crop)
     on_palm = mask > 0
     fill = float(np.count_nonzero(on_palm)) / mask.size
     if fill > 0.02:
@@ -163,12 +195,12 @@ def extract_palm(frame):
     else:
         brightness = sharpness = 0.0
     readings = {"fill": fill, "brightness": brightness, "sharpness": sharpness,
-                "skin": skin_like}
+                "skin": skin_like, "rect": rect}
 
     if not skin_like:
-        problem = "NO PALM IN THE CENTRE OF THE BOX"
+        problem = "SHOW YOUR PALM TO THE CAMERA"
     elif fill < MIN_FILL:
-        problem = "MOVE PALM CLOSER - FILL THE BOX"
+        problem = "MOVE PALM CLOSER"
     elif brightness < MIN_BRIGHTNESS:
         problem = "TOO DARK - ADD LIGHT"
     elif brightness > MAX_BRIGHTNESS:
@@ -330,8 +362,8 @@ def compare(live, enrolled):
             warped_mask = cv2.warpAffine(live_mask, warp, size, flags=cv2.INTER_NEAREST | inverse)
             method = f"D{quality:.2f}"
         else:
-            # Last resort: compare the palm exactly as placed in the box, with
-            # a wider shift search. The scan box keeps both roughly aligned, so
+            # Last resort: compare the palm exactly as detected, with
+            # a wider shift search. Detection keeps both roughly aligned, so
             # a genuine palm still scores low; an impostor still does not. The
             # 3-of-5 and 5-in-a-row gates remain the real security.
             warped, warped_mask = live_gray, live_mask
@@ -390,21 +422,23 @@ def load_enrollment():
 # Screen
 # ------------------------------------------------------------------
 
-def draw(frame, title, status, color, lines=(), progress=None):
-    x1, y1, x2, y2 = scan_box(frame)
-    shade = (frame * 0.35).astype(np.uint8)
-    shade[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
-    frame[:] = shade
+def draw(frame, title, status, color, lines=(), progress=None, rect=None):
+    # Highlight wherever the palm was detected (no fixed box to aim at).
+    if rect is not None:
+        x1, y1, x2, y2 = rect
+        shade = (frame * 0.4).astype(np.uint8)
+        shade[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+        frame[:] = shade
 
-    arm = (x2 - x1) // 6
-    for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
-        cv2.line(frame, (cx, cy), (cx + dx * arm, cy), color, 3)
-        cv2.line(frame, (cx, cy), (cx, cy + dy * arm), color, 3)
+        arm = (x2 - x1) // 6
+        for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
+            cv2.line(frame, (cx, cy), (cx + dx * arm, cy), color, 3)
+            cv2.line(frame, (cx, cy), (cx, cy + dy * arm), color, 3)
 
-    # Sweeping scan line
-    t = (np.sin(time.time() * 3) + 1) / 2
-    y = int(y1 + t * (y2 - y1))
-    cv2.line(frame, (x1 + 4, y), (x2 - 4, y), color, 1)
+        # Sweeping scan line across the detected palm
+        t = (np.sin(time.time() * 3) + 1) / 2
+        y = int(y1 + t * (y2 - y1))
+        cv2.line(frame, (x1 + 4, y), (x2 - 4, y), color, 1)
 
     cv2.putText(frame, title, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 217, 32), 2)
     cv2.putText(frame, status, (16, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
@@ -440,7 +474,7 @@ RED = (70, 70, 255)
 
 def enroll():
     print("ENROLL (manual): hold the SAME hand, palm facing the camera, fingers")
-    print("together, filling the box. When the status says READY, press SPACE.")
+    print("together, held up to the camera. When the status says READY, press SPACE.")
     print("Move the hand slightly between scans. R = retake last scan, ESC = cancel.")
     cap = open_camera()
     if not cap.isOpened():
@@ -470,7 +504,7 @@ def enroll():
                  [f"Scans: {len(grays)}/{ENROLL_SAMPLES}",
                   readings_line(readings),
                   "SPACE = capture   F = force capture   R = retake last   ESC = cancel"],
-                 len(grays) / ENROLL_SAMPLES)
+                 len(grays) / ENROLL_SAMPLES, rect=readings.get("rect"))
             cv2.imshow(WINDOW, frame)
             key = cv2.waitKey(1) & 0xFF
 
@@ -495,7 +529,7 @@ def enroll():
                 continue
             if forced and (not readings["skin"] or readings["fill"] < FORCE_MIN_FILL):
                 message, message_color, message_until = (
-                    "NOT CAPTURED: NO PALM IN THE BOX", RED, now + 1.5)
+                    "NOT CAPTURED: NO PALM DETECTED", RED, now + 1.5)
                 continue
 
             # Each new scan must line up with the first one.
@@ -505,7 +539,7 @@ def enroll():
                 aligned, d, how = compare((gray, mask, kp, desc), first)
                 if not aligned:
                     message, message_color, message_until = (
-                        "NOT CAPTURED: COULDN'T LINE UP WITH SCAN 1 - KEEP PALM CENTRED", RED, now + 2.0)
+                        "NOT CAPTURED: COULDN'T LINE UP WITH SCAN 1 - SAME HAND, SAME DISTANCE", RED, now + 2.0)
                     print("  rejected: could not align with scan 1")
                     continue
                 if d > ENROLL_MAX_DISTANCE:
@@ -529,7 +563,7 @@ def enroll():
           f"-> verify limit {cal['distance_limit']:.3f}")
     if cal["genuine_distance"] > ENROLL_MAX_DISTANCE:
         print("Your 5 scans are not consistent enough. Enroll again with brighter,")
-        print("even light, the palm flat and filling the box. Nothing was saved.")
+        print("even light, the palm flat and held steady. Nothing was saved.")
         return False
 
     save_enrollment(grays, masks)
@@ -568,7 +602,7 @@ def scan_palm(mismatch_seconds=None):
     no_match_time = 0.0
     scores = []
     readings = None
-    status, color = "PLACE PALM IN THE BOX", CYAN
+    status, color = "SHOW YOUR PALM TO THE CAMERA", CYAN
     try:
         while True:
             ok, frame = cap.read()
@@ -604,7 +638,8 @@ def scan_palm(mismatch_seconds=None):
                              + "  (F = features, D = dense)")
                 lines.append("Line distance: " + " ".join(f"{d:.2f}" if d < 1 else "--" for _, d, _ in scores)
                              + f"  (need <= {cal['distance_limit']:.2f})")
-            draw(frame, "FORTRESS PALM SCAN", status, color, lines, streak / REQUIRED_CONSECUTIVE)
+            rect = readings.get("rect") if readings else None
+            draw(frame, "FORTRESS PALM SCAN", status, color, lines, streak / REQUIRED_CONSECUTIVE, rect=rect)
 
             if streak >= REQUIRED_CONSECUTIVE:
                 cv2.imshow(WINDOW, frame)
@@ -612,7 +647,7 @@ def scan_palm(mismatch_seconds=None):
                 return "VERIFIED"
 
             if mismatch_seconds is not None and no_match_time >= mismatch_seconds:
-                draw(frame, "FORTRESS PALM SCAN", "PALM NOT RECOGNISED - ACCESS DENIED", RED, lines)
+                draw(frame, "FORTRESS PALM SCAN", "PALM NOT RECOGNISED - ACCESS DENIED", RED, lines, rect=rect)
                 cv2.imshow(WINDOW, frame)
                 cv2.waitKey(1500)
                 return "MISMATCH"
