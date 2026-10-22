@@ -32,8 +32,20 @@ except Exception as exc:
     sys.exit(1)
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "hand_landmarker.task"
-ENROLLMENT_PATH = BASE_DIR / "fortress_palm_enrollment.npz"
+MODEL_NAME = "hand_landmarker.task"
+ENROLLMENT_NAME = "fortress_palm_enrollment.npz"
+
+# Folders searched for the model and enrollment file, in order. The
+# script may be run from a temporary download folder, so it does not
+# rely on its own location only.
+SEARCH_DIRS = [
+    BASE_DIR,
+    Path.cwd(),
+    Path.home() / "Downloads" / "NEXUS",
+    Path.home() / "Downloads",
+    Path.home() / "Desktop" / "NEXUS",
+    Path.home() / "Documents" / "NEXUS",
+]
 ORB = cv2.ORB_create(nfeatures=500)
 MATCHER = cv2.BFMatcher(cv2.NORM_HAMMING)
 
@@ -121,12 +133,34 @@ def calibrate_threshold(enrolled):
     return threshold, genuine_level, genuine
 
 
+def find_project_folder():
+    """Folder holding hand_landmarker.task; asks for it if not found."""
+    for folder in SEARCH_DIRS:
+        if (folder / MODEL_NAME).is_file():
+            return folder
+
+    print(f"Could not find {MODEL_NAME} in:")
+    for folder in SEARCH_DIRS:
+        print("  ", folder)
+    while True:
+        typed = input("Paste the folder that contains hand_landmarker.task "
+                      "(or press Enter to exit): ").strip().strip('"')
+        if not typed:
+            return None
+        folder = Path(typed).expanduser()
+        if (folder / MODEL_NAME).is_file():
+            return folder
+        print("  Not found in", folder)
+
+
 def main():
-    if not MODEL_PATH.is_file():
-        print("Missing:", MODEL_PATH)
-        print("Put hand_landmarker.task beside this script.")
-        input("Press Enter to exit...")
+    project = find_project_folder()
+    if project is None:
         return
+    MODEL_PATH = project / MODEL_NAME
+    ENROLLMENT_PATH = project / ENROLLMENT_NAME
+    print("Using files from:", project)
+
     if not ENROLLMENT_PATH.is_file():
         print("Missing enrollment file:", ENROLLMENT_PATH)
         print("Run FORTRESS_PALM_ENROLL.py first and capture all 5 samples.")
