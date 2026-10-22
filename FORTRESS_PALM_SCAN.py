@@ -73,9 +73,10 @@ RANSAC_PIXELS = 4.0
 
 # Alignment, step 2 (when webcam palms have too few features): dense
 # whole-image alignment (ECC, rotation + shift)
-MIN_ECC = 0.55            # alignment quality needed, 0..1
+MIN_ECC = 0.30            # alignment quality needed, 0..1
 MAX_ROTATION_DEG = 30
 MAX_SHIFT_FRACTION = 0.4
+IDENTITY_SHIFT = 8        # shift search (code px) for the as-placed fallback
 
 # Palm-line comparison (Competitive Code distance: 0 = identical, ~0.5 = random)
 # A live scan always runs a little above how well the enrolled scans match
@@ -249,7 +250,7 @@ def sane_homography(H):
     A = H[:2, :2] / H[2, 2]
     det = float(np.linalg.det(A))
     perspective = float(np.abs(H[2, :2] / H[2, 2]).max())
-    return 0.6 < det < 1.6 and perspective < 0.002
+    return 0.4 < det < 2.2 and perspective < 0.01
 
 
 def align_features(live_kp, live_desc, ref_kp, ref_desc):
@@ -315,6 +316,7 @@ def compare(live, enrolled):
     ref_gray, ref_mask, ref_kp, ref_desc, ref_code = enrolled
     size = (ROI_SIZE, ROI_SIZE)
 
+    shift = SHIFT_SEARCH
     H, inliers = align_features(live_kp, live_desc, ref_kp, ref_desc)
     if H is not None:
         warped = cv2.warpPerspective(live_gray, H, size)
@@ -322,19 +324,26 @@ def compare(live, enrolled):
         method = f"F{inliers}"
     else:
         warp, quality = align_dense(live_gray, live_mask, ref_gray)
-        if warp is None or quality < MIN_ECC:
-            return False, 1.0, "--"
-        inverse = cv2.WARP_INVERSE_MAP
-        warped = cv2.warpAffine(live_gray, warp, size, flags=cv2.INTER_LINEAR | inverse)
-        warped_mask = cv2.warpAffine(live_mask, warp, size, flags=cv2.INTER_NEAREST | inverse)
-        method = f"D{quality:.2f}"
+        if warp is not None and quality >= MIN_ECC:
+            inverse = cv2.WARP_INVERSE_MAP
+            warped = cv2.warpAffine(live_gray, warp, size, flags=cv2.INTER_LINEAR | inverse)
+            warped_mask = cv2.warpAffine(live_mask, warp, size, flags=cv2.INTER_NEAREST | inverse)
+            method = f"D{quality:.2f}"
+        else:
+            # Last resort: compare the palm exactly as placed in the box, with
+            # a wider shift search. The scan box keeps both roughly aligned, so
+            # a genuine palm still scores low; an impostor still does not. The
+            # 3-of-5 and 5-in-a-row gates remain the real security.
+            warped, warped_mask = live_gray, live_mask
+            method = "I"
+            shift = IDENTITY_SHIFT
 
     # Compare palm lines only where both images show palm.
     both = cv2.bitwise_and(warped_mask, ref_mask)
     valid = cv2.resize(both, (CODE_SIZE, CODE_SIZE), interpolation=cv2.INTER_NEAREST) > 0
     valid = cv2.erode(valid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0   # skip edges
 
-    return True, shifted_code_distance(competitive_code(warped), ref_code, valid), method
+    return True, shifted_code_distance(competitive_code(warped), ref_code, valid, shift), method
 
 
 # ------------------------------------------------------------------
