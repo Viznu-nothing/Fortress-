@@ -145,31 +145,67 @@ _gemini_client = None
 _gemini_model = os.environ.get("GEMINI_MODEL") or None
 
 
-def get_gemini_key():
-    # Prefer the project's own key file. A stale GEMINI_API_KEY or
-    # GOOGLE_API_KEY environment variable must not override the key the
-    # user has placed beside this FORTRESS script.
-    key_file = os.path.join(CURRENT_FOLDER, "gemini_key.txt")
-    if os.path.isfile(key_file):
-        with open(key_file, "r", encoding="utf-8-sig") as f:
-            key = f.read().strip()
-        # Tolerate accidental surrounding quotes or a pasted variable prefix.
-        if key.startswith(("\"", "'")) and key.endswith(("\"", "'")) and len(key) >= 2:
-            key = key[1:-1].strip()
-        if key.upper().startswith(("GEMINI_API_KEY=", "GOOGLE_API_KEY=")):
-            key = key.split("=", 1)[1].strip().strip("\"'")
-        if key:
-            return key
+def _clean_key(raw):
+    key = raw.strip()
+    # Accidental surrounding quotes, or a pasted "NAME=..." prefix.
+    if len(key) >= 2 and key[0] in "\"'" and key[-1] in "\"'":
+        key = key[1:-1].strip()
+    if key.upper().startswith(("GEMINI_API_KEY=", "GOOGLE_API_KEY=")):
+        key = key.split("=", 1)[1].strip().strip("\"'")
+    return key
 
-    # Environment variables are only fallbacks when no usable project key exists.
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    return key.strip() if key and key.strip() else None
+
+def get_gemini_key(verbose=False):
+    # Prefer a project key file over a possibly-stale environment variable.
+    folders = [
+        os.path.dirname(os.path.abspath(__file__)),
+        os.getcwd(),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "NEXUS"),
+    ]
+    # Windows hides extensions, so "gemini_key.txt" often becomes
+    # gemini_key.txt.txt; accept the usual variants.
+    names = ["gemini_key.txt", "gemini_key.txt.txt", "gemini_key",
+             "GEMINI_API_KEY.txt", "api_key.txt"]
+
+    checked = []
+    for folder in folders:
+        for name in names:
+            path = os.path.join(folder, name)
+            checked.append(path)
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8-sig") as f:
+                        key = _clean_key(f.read())
+                except Exception as exc:
+                    if verbose:
+                        print("NEXUS AI: could not read", path, "-", exc)
+                    continue
+                if key:
+                    if verbose:
+                        print("NEXUS AI: Gemini key loaded from", path)
+                    return key
+                elif verbose:
+                    print("NEXUS AI:", path, "is empty")
+
+    env = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if env and env.strip():
+        if verbose:
+            print("NEXUS AI: Gemini key loaded from environment variable")
+        return _clean_key(env)
+
+    if verbose:
+        print("NEXUS AI: NO GEMINI KEY FOUND. Looked for a key file here:")
+        for path in checked:
+            print("   ", path)
+        print("Create 'gemini_key.txt' next to FORTRESS_NEXUS.py with your key"
+              " inside (make sure it is not named gemini_key.txt.txt).")
+    return None
 
 
 def get_gemini_client():
     global _gemini_client
     if _gemini_client is None:
-        key = get_gemini_key()
+        key = get_gemini_key(verbose=True)
         if not key:
             raise RuntimeError("NO_GEMINI_KEY")
         _gemini_client = genai.Client(api_key=key)
@@ -247,6 +283,11 @@ def load_nexus_knowledge():
 
 
 NEXUS_KNOWLEDGE = load_nexus_knowledge()
+
+# Report the Gemini key situation at startup so a missing key is obvious.
+if get_gemini_key(verbose=True) is None:
+    print("NEXUS AI: starting WITHOUT a Gemini key - the assistant will say so"
+          " until gemini_key.txt is added. Everything else still works.")
 
 
 # ============================================================
