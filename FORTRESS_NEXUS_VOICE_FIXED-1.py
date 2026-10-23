@@ -178,7 +178,21 @@ def _mask_key(key):
     return f"{key[:6]}...{key[-4:]} ({len(key)} chars)"
 
 
+# Optional: paste your free key from https://aistudio.google.com/apikey
+# between the quotes. Leaving it blank is fine (NEXUS then uses the key
+# file, the environment variable, or built-in offline answers).
+INLINE_GEMINI_KEY = ""
+
+
 def get_gemini_key(verbose=False):
+    # 0) An inline key pasted into this file wins, if it looks real.
+    if INLINE_GEMINI_KEY and INLINE_GEMINI_KEY.strip() and "your key" not in INLINE_GEMINI_KEY.lower():
+        key = _clean_key(INLINE_GEMINI_KEY)
+        if key:
+            if verbose:
+                print("NEXUS AI: Gemini key loaded from INLINE_GEMINI_KEY ->", _mask_key(key))
+            return key
+
     # Prefer a project key file over a possibly-stale environment variable.
     here = os.path.dirname(os.path.abspath(__file__))
     folders = [here, os.getcwd(), os.path.join(here, "NEXUS")]
@@ -366,9 +380,57 @@ def load_nexus_knowledge():
 NEXUS_KNOWLEDGE = load_nexus_knowledge()
 
 # Report the Gemini key situation at startup so a missing key is obvious.
+# NEXUS still runs without a key: it falls back to built-in offline answers.
 if get_gemini_key(verbose=True) is None:
-    print("NEXUS AI: starting WITHOUT a Gemini key - the assistant will say so"
-          " until gemini_key.txt is added. Everything else still works.")
+    print("NEXUS AI: no Gemini key - NEXUS will use built-in OFFLINE answers."
+          " Add gemini_key.txt (or set INLINE_GEMINI_KEY) for full AI.")
+
+
+def offline_nexus_answer(message):
+    """Answer from live FORTRESS state when Gemini is unavailable, so NEXUS
+    never goes silent. Handles status and per-layer questions; keeps it short."""
+    msg = (message or "").lower()
+
+    face = state.get("FACE VERIFICATION", "LOCKED")
+    palm = state.get("PALM VERIFICATION", "LOCKED")
+    pin = state.get("PHONE PIN", "LOCKED")
+    card = state.get("CARD VERIFICATION", "LOCKED")
+    vault = state.get("VAULT", "LOCKED")
+    done = {"PASSED", "VERIFIED"}
+
+    if any(w in msg for w in ("vault", "unlock", "access", "authorise", "authorize", "open")):
+        if vault == "AUTHORIZED":
+            return "The vault is authorized. All verification layers passed."
+        return "The vault is locked. All verification layers must pass before access is authorized."
+
+    if any(w in msg for w in ("status", "state", "next", "which", "stage", "left", "remaining", "pending", "progress")):
+        order = [("face", face), ("palm", palm), ("phone PIN", pin), ("card", card)]
+        pending = [name for name, s in order if s not in done]
+        finished = [name for name, s in order if s in done]
+        if not pending:
+            tail = "Vault authorized." if vault == "AUTHORIZED" else "Awaiting final authorization."
+            return "All four layers are verified. " + tail
+        return f"Completed: {', '.join(finished) if finished else 'none'}. Next step: {pending[0]} verification."
+
+    if "face" in msg:
+        return f"Face verification is {face}."
+    if "palm" in msg:
+        return f"Palm verification is {palm}."
+    if "pin" in msg or "password" in msg:
+        return f"Phone PIN is {pin}."
+    if "card" in msg or "qr" in msg:
+        return f"Card verification is {card}."
+
+    if any(w in msg for w in ("who are you", "what are you", "your name", "about nexus")):
+        return "I am NEXUS, the intelligence layer of the FORTRESS security system."
+    if "help" in msg or "what can you" in msg:
+        return ("I monitor FORTRESS: face, palm, phone PIN and card verification, and the"
+                " vault. Ask me about any layer or the current status.")
+    if any(w in msg for w in ("hi", "hello", "hey", "good morning", "good evening", "good afternoon")):
+        return "NEXUS online. FORTRESS security intelligence system active."
+
+    return ("NEXUS is in offline mode. I can report FORTRESS status and the verification"
+            " layers. Add a Gemini key for full conversational answers.")
 
 
 # ============================================================
@@ -3478,19 +3540,17 @@ Respond as NEXUS.
             message
         )
 
+        # Try Gemini first; if it fails for any reason (no key, rejected,
+        # overloaded, no internet), fall back to built-in offline answers so
+        # NEXUS always responds during the demo.
         try:
 
             answer = ask_gemini(
                 prompt
             )
 
-            if not answer:
-
-                answer = (
-                    "NEXUS could not generate a response."
-                )
-
-            return answer
+            if answer:
+                return answer
 
         except Exception as error:
 
@@ -3500,10 +3560,7 @@ Respond as NEXUS.
                 error
             )
 
-            return (
-                "NEXUS AI connection unavailable: "
-                + describe_ai_error(error)
-            )
+        return offline_nexus_answer(message)
 
     # ========================================================
     # NEXUS — TEXT CHAT
