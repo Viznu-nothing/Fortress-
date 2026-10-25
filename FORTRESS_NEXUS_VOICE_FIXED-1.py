@@ -430,7 +430,196 @@ def offline_nexus_answer(message):
         return "NEXUS online. FORTRESS security intelligence system active."
 
     return ("NEXUS is in offline mode. I can report FORTRESS status and the verification"
-            " layers. Add a Gemini key for full conversational answers.")
+            " layers. Add a Grok key for full conversational answers.")
+
+
+# ============================================================
+# NEXUS AI — GROK (xAI)
+#
+# Grok's API is OpenAI-style, so only `requests` is needed. It requires a
+# PAID xAI key (xai-...) with credit from https://console.x.ai .
+# Put the key in grok_key.txt next to this script, or set XAI_API_KEY,
+# or paste it into INLINE_GROK_KEY below. If Grok is unavailable, NEXUS
+# falls back to the built-in offline answers.
+# ============================================================
+
+GROK_API_URL = (os.environ.get("XAI_API_URL") or "https://api.x.ai/v1").rstrip("/")
+INLINE_GROK_KEY = ""
+GROK_MODELS = [
+    "grok-2-latest", "grok-2-1212", "grok-3", "grok-3-mini", "grok-beta", "grok-4",
+]
+GROK_MAX_TOKENS = 300
+_grok_model = os.environ.get("GROK_MODEL") or None
+
+
+def _extract_grok_key(raw):
+    match = re.search(r"xai-[A-Za-z0-9\-_]{20,}", raw)
+    if match:
+        return match.group(0)
+    for line in raw.splitlines():
+        if line.strip():
+            key = line.strip().strip("\"'")
+            if key.upper().startswith(("XAI_API_KEY=", "GROK_API_KEY=")):
+                key = key.split("=", 1)[1].strip().strip("\"'")
+            return key
+    return ""
+
+
+def get_grok_key(verbose=False):
+    if INLINE_GROK_KEY and INLINE_GROK_KEY.strip() and "your key" not in INLINE_GROK_KEY.lower():
+        key = _extract_grok_key(INLINE_GROK_KEY)
+        if key:
+            if verbose:
+                print("NEXUS AI: Grok key loaded from INLINE_GROK_KEY ->", _mask_key(key))
+            return key
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    folders = [here, os.getcwd(), os.path.join(here, "NEXUS")]
+    names = ["grok_key.txt", "grok_key.txt.txt", "grok_key",
+             "xai_key.txt", "XAI_API_KEY.txt"]
+    checked = []
+    for folder in folders:
+        for name in names:
+            path = os.path.join(folder, name)
+            checked.append(path)
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8-sig") as f:
+                        key = _extract_grok_key(f.read())
+                except Exception as exc:
+                    if verbose:
+                        print("NEXUS AI: could not read", path, "-", exc)
+                    continue
+                if key:
+                    if verbose:
+                        print("NEXUS AI: Grok key loaded from", path, "->", _mask_key(key))
+                        if not key.startswith("xai-"):
+                            print("NEXUS AI: WARNING - an xAI key normally starts with 'xai-'.")
+                    return key
+
+    env = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
+    if env and env.strip():
+        if verbose:
+            print("NEXUS AI: Grok key loaded from environment variable")
+        return _extract_grok_key(env)
+
+    if verbose:
+        print("NEXUS AI: NO GROK KEY FOUND. Looked for a key file here:")
+        for path in checked:
+            print("   ", path)
+        print("Create a key at https://console.x.ai and put it in grok_key.txt"
+              " next to this script.")
+    return None
+
+
+def discover_grok_models(key):
+    try:
+        response = requests.get(
+            GROK_API_URL + "/models",
+            headers={"Authorization": "Bearer " + key},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        rows = data.get("data", data.get("models", []))
+        return [row.get("id") or row.get("name") for row in rows if (row.get("id") or row.get("name"))]
+    except Exception as exc:
+        print("NEXUS AI: could not list Grok models -", exc)
+        return []
+
+
+_grok_announced = False
+
+
+def ask_grok(prompt):
+    """Answer with Grok (xAI). Tries the model list, then the key's own models."""
+    global _grok_model, _grok_announced
+    key = get_grok_key()
+    if not key:
+        raise RuntimeError("NO_GROK_KEY")
+
+    if _grok_model:
+        models = [_grok_model]
+    else:
+        models = list(GROK_MODELS)
+        for name in discover_grok_models(key):
+            if name not in models:
+                models.append(name)
+
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+    last_error = None
+    for model in models:
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    GROK_API_URL + "/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": GROK_MAX_TOKENS,
+                        "temperature": 0.4,
+                    },
+                    timeout=60,
+                )
+            except Exception as error:
+                last_error = error
+                print("NEXUS AI Grok request failed:", model, type(error).__name__, error)
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+
+            if response.status_code in (401, 403):
+                raise RuntimeError("GROK_KEY_REJECTED: " + response.text[:150])
+            if response.status_code == 429:
+                last_error = RuntimeError("GROK_RATE_LIMIT")
+                if attempt < 2:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                break
+            if response.status_code == 404 or (
+                response.status_code == 400 and "model" in response.text.lower()
+            ):
+                last_error = RuntimeError(f"model {model} not available")
+                break   # try the next model
+            if response.status_code >= 500:
+                last_error = RuntimeError(f"Grok server error {response.status_code}")
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+
+            response.raise_for_status()
+            answer = (response.json()["choices"][0]["message"]["content"] or "").strip()
+            if not _grok_model:
+                _grok_model = model
+                _grok_announced = True
+                print("NEXUS AI: using Grok model", model)
+            return answer
+
+    raise last_error if last_error else RuntimeError("no Grok model available")
+
+
+def describe_grok_error(error):
+    text = str(error).lower()
+    if str(error) == "NO_GROK_KEY":
+        return "no Grok key. Put your xai-... key in grok_key.txt next to this script."
+    if "grok_key_rejected" in text or "invalid api key" in text or "unauthorized" in text:
+        return "the Grok (xAI) key was rejected. Check grok_key.txt / your xAI billing."
+    if "grok_rate_limit" in text or "429" in text or "rate limit" in text:
+        return "Grok rate limit or no credit. Check your xAI account balance."
+    if any(w in text for w in ("connect", "timed out", "timeout", "getaddrinfo", "network")):
+        return "no internet connection to Grok."
+    if "no grok model" in text or "model" in text and "not available" in text:
+        return "no Grok model is available for this key."
+    return type(error).__name__ + ": " + str(error)[:90]
+
+
+# Report the Grok key situation at startup.
+if get_grok_key(verbose=True) is None:
+    print("NEXUS AI: no Grok key - NEXUS will use built-in OFFLINE answers."
+          " Add grok_key.txt (xai-... key) for full AI.")
 
 
 # ============================================================
@@ -3545,7 +3734,7 @@ Respond as NEXUS.
         # NEXUS always responds during the demo.
         try:
 
-            answer = ask_gemini(
+            answer = ask_grok(
                 prompt
             )
 
@@ -3555,7 +3744,7 @@ Respond as NEXUS.
         except Exception as error:
 
             print(
-                "NEXUS Gemini error:",
+                "NEXUS Grok error:",
                 type(error).__name__,
                 error
             )
